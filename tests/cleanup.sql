@@ -5,3 +5,4 @@ DELETE FROM payments WHERE trip_id IN (SELECT id FROM trips WHERE name LIKE 'zz%
 DELETE FROM trips WHERE name LIKE 'zz%';
 DELETE FROM people WHERE name LIKE 'zz%' AND id NOT IN (SELECT person_id FROM members);
 DELETE FROM admins WHERE username LIKE 'zz%';
+DELETE FROM invites WHERE note LIKE 'zz%';

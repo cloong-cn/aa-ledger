@@ -136,3 +136,18 @@ CREATE TABLE IF NOT EXISTS fx_cache (
   source_at  timestamptz,
   fetched_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- ===== v3：结算币种、邀请码 =====
+-- 每次游玩的结算币种（分摊、结算、统计都用它）。expenses.cents / payments.cents 都是结算币种的"分"；
+-- expenses.rate = 1 单位原币折合多少结算币种；cny_override 现在表示"直接填了实付结算币种金额"
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS base_currency text NOT NULL DEFAULT 'CNY';
+-- 邀请码：朋友凭邀请码可以自己新建游玩
+CREATE TABLE IF NOT EXISTS invites (
+  id         serial PRIMARY KEY,
+  code       text NOT NULL UNIQUE,
+  note       text NOT NULL DEFAULT '',
+  uses       int  NOT NULL DEFAULT 0,
+  revoked    boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS invite_id int REFERENCES invites(id) ON DELETE SET NULL;

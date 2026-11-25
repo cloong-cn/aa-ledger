@@ -51,5 +51,8 @@ for (let i = 0; i < 2000; i++) {
   if (r.reduce((a, x) => a + x.cents, 0) !== c || r.reduce((a, x) => a + x.origCents, 0) !== o) { fail++; console.log('✗ 折算求和', o, c); break; }
 }
 pass++;
+eq('日元整円分摊', computeShares(100000, [1, 2, 3].map((id) => ({ memberId: id, weight: 1, fixed: null })), 100).map((x) => x.cents), [33400, 33300, 33300]);
+eq('人民币折日元整円', splitExpense(1000, 47700, [1, 2, 3].map((id) => ({ memberId: id, weight: 1, fixed: null })), 1, 100).map((x) => x.cents), [15900, 15900, 15900]);
+eq('日元结算零头', splitExpense(1000, 47800, [1, 2, 3].map((id) => ({ memberId: id, weight: 1, fixed: null })), 1, 100).map((x) => x.cents), [16000, 15900, 15900]);
 console.log(`算法测试：通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

@@ -297,3 +297,10 @@ textarea.input { resize: vertical; min-height: 64px; }
 .code-box { text-align: center; }
 .code-box img { max-width: 100%; max-height: 60vh; border-radius: 12px; }
 .note-box { white-space: pre-wrap; background: var(--card); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
+a.item { color: var(--text); }
+.xfer .who[data-remind] { cursor: pointer; }
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▸ "; }
+details[open] > summary::before { content: "▾ "; }
+.tag { white-space: nowrap; }

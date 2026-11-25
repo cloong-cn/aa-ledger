@@ -147,7 +147,7 @@ ok('外币指定金额按原币', JSON.stringify(j2.shares.map((s) => [s.origCen
 r = await call('POST', `/api/t/${key}/expenses`, { amount: '500', currency: 'HKD', cny: '470.12', payerId: C, shares: [A, B, C].map((id) => ({ memberId: id })) });
 const H1 = r.data.id;
 r = await call('GET', `/api/t/${key}`); let h1 = r.data.expenses.find((e) => e.id === H1);
-ok('实付人民币', h1.cents === 47012 && h1.cnyOverride && h1.shares.reduce((a, s) => a + s.cents, 0) === 47012, JSON.stringify(h1));
+ok('实付人民币', h1.cents === 47012 && h1.baseOverride && h1.shares.reduce((a, s) => a + s.cents, 0) === 47012, JSON.stringify(h1));
 ok('港币首次自动用市场汇率', r.data.rates.HKD?.rate > 0);
 r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', currency: 'USD', rate: 'abc', payerId: A, shares: [{ memberId: A }] }); ok('非法汇率被拒', r.status === 400);
 r = await call('POST', `/api/t/${key}/expenses`, { amount: '1', currency: 'JPY', payerId: A, shares: [{ memberId: A }] });
@@ -168,6 +168,66 @@ r = await call('PUT', `/api/t/${key}/rates/JPY`, { rate: '0' }); ok('汇率 0 �
 r = await call('PUT', `/api/t/${key}/expenses/${J2}`, { amount: '50', currency: 'CNY', payerId: B, shares: [A, B].map((id) => ({ memberId: id })) });
 r = await call('GET', `/api/t/${key}`); j2 = r.data.expenses.find((e) => e.id === J2);
 ok('外币改回人民币', j2.currency === 'CNY' && j2.cents === 5000 && j2.origCents === 5000 && j2.rate === 1);
+
+// ===== 导出 Excel =====
+r = await call('GET', `/api/t/${key}/export`);
+ok('导出 Excel', r.status === 200 && r.ct.includes('spreadsheetml') && r.data.subarray(0, 2).toString() === 'PK', r.status);
+
+// ===== 结算币种 =====
+cookie = adminCookie;
+r = await call('POST', '/api/admin/trips', { name: 'zz日本', startDay: '2026-12-01', baseCurrency: 'JPY', members: ['zz甲', 'zz乙'] });
+ok('建日元结算的游玩', r.status === 200); const jkey = r.data.key; const jid = r.data.id;
+cookie = '';
+r = await call('GET', `/api/t/${jkey}`); const [JA, JB] = r.data.members.map((m) => m.id);
+ok('结算币种 JPY', r.data.trip.base === 'JPY' && r.data.fx.rates.CNY > 1, JSON.stringify(r.data.fx));
+r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '3000', payerId: JA, shares: [JA, JB].map((id) => ({ memberId: id })) });
+ok('默认币种=结算币种', r.status === 200);
+r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '100', currency: 'CNY', rate: '20', payerId: JB, shares: [JA, JB].map((id) => ({ memberId: id })) });
+r = await call('GET', `/api/t/${jkey}`);
+ok('人民币折日元 100×20=2000', r.data.expenses.find((e) => e.currency === 'CNY')?.cents === 200000 && r.data.expenses.find((e) => e.currency === 'JPY')?.cents === 300000);
+ok('toCny 用本次汇率', Math.abs(r.data.trip.toCny - 0.05) < 1e-9, r.data.trip.toCny);
+r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '10.5', payerId: JA, shares: [{ memberId: JA }] }); ok('日元不能有小数', r.status === 400);
+r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '1000', payerId: JA, shares: [JA, JB].map((id) => ({ memberId: id })).concat([]) });
+const J3 = r.data.id;
+r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '33.33', currency: 'CNY', payerId: JA, shares: [JA, JB].map((id) => ({ memberId: id })) });
+const J4 = r.data.id;
+r = await call('GET', `/api/t/${jkey}`);
+const j4 = r.data.expenses.find((e) => e.id === J4);
+ok('人民币折日元取整', j4.cents === 66700 && j4.shares.every((x) => x.cents % 100 === 0), JSON.stringify(j4));
+ok('日元结算净额都是整円', r.data.balances.every((b) => b.net % 100 === 0) && r.data.transfers.every((t) => t.cents % 100 === 0));
+r = await call('POST', `/api/t/${jkey}/payments`, { fromId: JA, toId: JB, amount: '1.5' }); ok('日元转账不能有小数', r.status === 400);
+for (const id of [J3, J4]) await call('DELETE', `/api/t/${jkey}/expenses/${id}`);
+// 换结算币种 JPY → CNY（1 日元 = 0.05 人民币）
+r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'CNY', rate: '0.05' });
+ok('换结算币种', r.status === 200 && r.data.recomputed === 2, JSON.stringify(r.data));
+r = await call('GET', `/api/t/${jkey}`);
+const jy = r.data.expenses.find((e) => e.currency === 'JPY'), cn = r.data.expenses.find((e) => e.currency === 'CNY');
+ok('换后：日元账 3000×0.05=150，人民币账=100', r.data.trip.base === 'CNY' && jy.cents === 15000 && jy.rate === 0.05 && cn.cents === 10000 && cn.rate === 1, JSON.stringify([jy, cn]));
+ok('换后汇率表只剩 JPY', JSON.stringify(Object.keys(r.data.rates)) === '["JPY"]' && r.data.rates.JPY.rate === 0.05);
+r = await call('POST', `/api/t/${jkey}/payments`, { fromId: JA, toId: JB, amount: '1' });
+r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'USD' }); ok('有转账后不能换', r.status === 400);
+cookie = adminCookie;
+r = await call('GET', '/api/admin/stats?year=2026'); const jt = r.data.trips.find((t) => t.id === jid);
+ok('年度统计折算人民币', jt && jt.total === 25000, JSON.stringify(jt));
+
+// ===== 邀请码 =====
+cookie = '';
+r = await call('POST', '/api/invite/trips', { code: 'WRONGCODE', name: 'zz邀请', startDay: '2026-12-01' }); ok('错误邀请码 403', r.status === 403);
+cookie = adminCookie;
+r = await call('POST', '/api/admin/invites', { note: 'zz阿杰' }); ok('生成邀请码', r.status === 200 && r.data.code.length === 10); const inv = r.data;
+cookie = '';
+r = await call('POST', '/api/invite/trips', { code: inv.code.toLowerCase().replace(/(.{5})/, '$1-'), name: 'zz邀请建的', startDay: '2026-12-02', creator: 'zz阿杰', members: ['zz乙'], baseCurrency: 'HKD' });
+ok('凭邀请码建游玩', r.status === 200 && r.data.key && r.data.meId, JSON.stringify(r.data)); const ikey = r.data.key;
+r = await call('GET', `/api/t/${ikey}`); ok('创建人自动加入、港币结算', r.data.members.some((m) => m.name === 'zz阿杰') && r.data.trip.base === 'HKD');
+r = await call('GET', '/api/admin/invites'); ok('普通人不能看邀请码', r.status === 401);
+cookie = adminCookie;
+r = await call('GET', '/api/admin/invites'); ok('使用次数', r.data.invites.find((i) => i.id === inv.id)?.uses === 1);
+r = await call('GET', '/api/admin/trips'); ok('列表显示邀请人', r.data.trips.find((t) => t.key === ikey)?.inviteNote === 'zz阿杰');
+r = await call('DELETE', `/api/admin/invites/${inv.id}`); ok('停用邀请码', r.status === 200);
+cookie = '';
+r = await call('POST', '/api/invite/trips', { code: inv.code, name: 'zz再来', startDay: '2026-12-02' }); ok('停用后不能用', r.status === 403);
+cookie = adminCookie;
+for (const k of [jkey, ikey]) { const t = await call('GET', `/api/t/${k}`); await call('DELETE', `/api/admin/trips/${t.data.trip.id}`); }
 
 // 操作记录
 r = await call('GET', `/api/t/${key}/log`);

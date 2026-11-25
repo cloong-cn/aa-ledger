@@ -1,7 +1,7 @@
 'use strict';
 // AA 账本前端：无框架。/ = 管理员首页，/t/<key> = 某次游玩（凭分享链接）
 const $app = document.getElementById('app');
-const { computeShares, splitExpense } = window.AASettle;
+const { computeShares, splitExpense, unitOf, roundTo } = window.AASettle;
 
 const CATS = [
   { key: 'food', name: '餐饮', icon: '🍜' },
@@ -13,7 +13,7 @@ const CATS = [
   { key: 'other', name: '其他', icon: '📦' },
 ];
 const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
-// 币种（顺序即选择顺序）。结算统一折算成人民币
+// 币种（顺序即选择顺序）。每次游玩有一个结算币种（默认人民币），其他币种折算成它
 const CURS = [
   { key: 'CNY', name: '人民币', short: '人民币', sym: '¥' },
   { key: 'HKD', name: '港币', short: '港币', sym: 'HK$' },
@@ -25,6 +25,9 @@ const CURS = [
   { key: 'USD', name: '美元', short: '美元', sym: 'US$' },
 ];
 const CUR = Object.fromEntries(CURS.map((c) => [c.key, c]));
+// 当前页面的结算币种：游玩页 = 这次游玩的结算币种；管理员页 = 人民币
+let BASE = 'CNY';
+const BN = () => CUR[BASE].name;
 const fmtRate = (r) => String(Number(r.toPrecision(6)));
 const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
@@ -33,10 +36,10 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 function money(c, { sign = false, cur = true } = {}) {
   const neg = c < 0; const a = Math.abs(c);
   const s = (a / 100).toFixed(a % 100 === 0 ? 0 : 2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? '¥' : '') + s;
+  return (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? CUR[BASE].sym : '') + s;
 }
-// 原币金额：人民币用 ¥，其他币种用各自符号
-const curMoney = (cur, c) => (!cur || cur === 'CNY' ? money(c) : CUR[cur].sym + money(c, { cur: false }));
+// 指定币种的金额（带该币种符号）
+const curMoney = (cur, c) => (c < 0 ? '-' : '') + CUR[cur || BASE].sym + money(Math.abs(c), { cur: false });
 const amountInput = (c) => (c / 100).toFixed(c % 100 === 0 ? 0 : 2);
 const md = (day) => `${Number(day.slice(5, 7))}月${Number(day.slice(8))}日`;
 const wk = (day) => '周' + WEEK[new Date(day + 'T00:00:00Z').getUTCDay()];
@@ -170,18 +173,36 @@ async function route() {
 }
 
 // ---------- 登录 ----------
+// 最近打开过的游玩（只存在这台设备上）
+function recentTrips() {
+  try { return JSON.parse(store.get('aa:recent') || '[]').filter((x) => x && /^[A-Za-z0-9_-]{16,32}$/.test(x.key)); } catch { return []; }
+}
+function rememberTrip(key, t) {
+  const list = recentTrips().filter((x) => x.key !== key);
+  list.unshift({ key, name: t.name, range: range(t), at: Date.now() });
+  store.set('aa:recent', JSON.stringify(list.slice(0, 20)));
+}
+function forgetTrip(key) { store.set('aa:recent', JSON.stringify(recentTrips().filter((x) => x.key !== key))); }
+
 function renderLogin() {
+  BASE = 'CNY';
   document.title = 'AA 账本';
+  const recent = recentTrips();
   $app.innerHTML = `<div class="login">
     <div class="logo">AA</div>
     <h1>AA 账本</h1>
-    <p class="muted" style="margin:0 0 22px">出去玩花的钱，记下来，自动算谁该给谁多少。<br>朋友请直接打开群里分享的链接，不用登录。</p>
+    <p class="muted" style="margin:0 0 18px">出去玩花的钱，记下来，自动算谁该给谁多少。<br>朋友直接打开群里分享的链接就行，不用登录。</p>
+    ${recent.length ? `<div class="section-title" style="margin-top:0"><span>最近打开的游玩</span></div>
+      ${recent.map((x) => `<a class="trip" href="/t/${esc(x.key)}" data-link><div class="r1"><b>${esc(x.name)}</b></div><div class="r2"><span>${esc(x.range)}</span><span>${fmtTime(x.at)} 打开过</span></div></a>`).join('')}` : ''}
+    <button class="btn block" id="inv-new" style="margin:6px 0 18px">🎟️ 有邀请码？自己新建一次游玩</button>
+    <details ${recent.length ? '' : 'open'}><summary class="muted small" style="cursor:pointer;margin-bottom:12px">管理员登录</summary>
     <form id="lf">
       <div class="field"><label for="lu">管理员账号</label><input class="input" id="lu" name="username" autocomplete="username" required></div>
       <div class="field"><label for="lp">密码</label><input class="input" id="lp" name="password" type="password" autocomplete="current-password" required></div>
       <div class="err" id="le"></div>
       <button class="btn primary block">登录</button>
-    </form></div>`;
+    </form></details></div>`;
+  document.getElementById('inv-new').onclick = () => newTripSheet(true);
   document.getElementById('lf').onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -194,6 +215,7 @@ function renderLogin() {
 // 管理员首页
 // ======================================================================
 async function renderAdmin() {
+  BASE = 'CNY';
   document.title = 'AA 账本';
   $app.innerHTML = `<div class="wrap">
     <div class="top"><h1>AA 账本</h1>
@@ -202,7 +224,7 @@ async function renderAdmin() {
     <div class="seg"><button data-at="trips" class="${S.adminTab === 'trips' ? 'on' : ''}">游玩</button><button data-at="stats" class="${S.adminTab === 'stats' ? 'on' : ''}">年度统计</button></div>
     <div id="admin-body"><div class="empty">加载中…</div></div></div>`;
   $app.querySelectorAll('[data-at]').forEach((b) => b.onclick = () => { S.adminTab = b.dataset.at; renderAdmin(); });
-  document.getElementById('new-trip').onclick = newTripSheet;
+  document.getElementById('new-trip').onclick = () => newTripSheet(false);
   document.getElementById('admin-menu').onclick = adminMenu;
   const body = document.getElementById('admin-body');
   try {
@@ -220,11 +242,11 @@ function tripListHtml(trips) {
     const mon = t.startDay.slice(0, 7);
     if (mon !== lastMonth) { html += `<div class="section-title"><span>${mon.slice(0, 4)} 年 ${Number(mon.slice(5))} 月</span></div>`; lastMonth = mon; }
     const status = t.locked ? '<span class="tag">已锁定</span>'
-      : t.unsettled > 0 ? `<span class="tag warn">待结清 ${money(t.unsettled)}</span>`
+      : t.unsettled > 0 ? `<span class="tag warn">待结清 ${curMoney(t.base, t.unsettled)}</span>`
       : t.count ? '<span class="tag good">已结清</span>' : '<span class="tag">还没记账</span>';
     html += `<a class="trip" href="/t/${esc(t.key)}" data-link>
-      <div class="r1"><b>${esc(t.name)}</b><span class="amt num">${money(t.total)}</span></div>
-      <div class="r2"><span>${range(t)} · ${t.members} 人 · ${t.count} 笔</span>${status}</div></a>`;
+      <div class="r1"><b>${esc(t.name)}</b><span class="amt num">${curMoney(t.base, t.total)}</span></div>
+      <div class="r2"><span>${range(t)} · ${t.members} 人 · ${t.count} 笔${t.inviteNote ? ` · 🎟️${esc(t.inviteNote)}` : ''}</span>${status}</div></a>`;
   }
   return html;
 }
@@ -260,9 +282,11 @@ function adminStatsHtml(d) {
 function adminMenu() {
   openSheet(`${sheetHead('管理员')}
     <div class="list">
+      <button class="item" id="am-inv"><span class="cat">🎟️</span><span class="main"><span class="t">邀请码</span><span class="s">发给朋友，他们就能自己新建游玩</span></span></button>
       <button class="item" id="am-pw"><span class="cat">🔑</span><span class="main"><span class="t">修改密码</span></span></button>
       <button class="item" id="am-out"><span class="cat">↩︎</span><span class="main"><span class="t">退出登录</span><span class="s">${esc(S.admin.username)}</span></span></button>
     </div>`, (el) => {
+    el.querySelector('#am-inv').onclick = invitesSheet;
     el.querySelector('#am-out').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); closeSheet(); route(); };
     el.querySelector('#am-pw').onclick = () => openSheet(`${sheetHead('修改密码')}
       <form id="pwf"><div class="field"><label>原密码</label><input class="input" type="password" name="old" autocomplete="current-password" required></div>
@@ -277,27 +301,64 @@ function adminMenu() {
   });
 }
 
-async function newTripSheet() {
+const fmtCode = (c) => c.replace(/(.{5})(?=.)/, '$1-');
+async function copyText(text, okMsg = '已复制') {
+  try { await navigator.clipboard.writeText(text); toast(okMsg); return true; }
+  catch { toast('复制失败，请长按文字手动复制', true); return false; }
+}
+async function invitesSheet() {
+  let list = [];
+  try { list = (await api('GET', '/api/admin/invites')).invites; } catch (e) { return toast(e.message, true); }
+  const inviteText = (c) => `AA 账本邀请码：${fmtCode(c)}\n打开 ${location.origin} ，点「有邀请码？自己新建一次游玩」，填入邀请码就能开一个新的游玩记账。`;
+  openSheet(`${sheetHead('邀请码')}
+    <p class="muted small" style="margin-top:-6px">拿到邀请码的人可以自己新建游玩（只能新建，看不到别的游玩）。不想让谁用了就停用。</p>
+    <div class="row2" style="margin-bottom:12px"><input class="input" id="iv-note" maxlength="30" placeholder="给谁用的（备注，可选）"><button class="btn primary" id="iv-add" style="flex:none">生成</button></div>
+    <div class="list">${list.length ? list.map((i) => `<div class="mem" style="${i.revoked ? 'opacity:.5' : ''}">
+      <span class="main"><b class="num" style="letter-spacing:.04em">${fmtCode(i.code)}</b>${i.revoked ? ' <span class="tag">已停用</span>' : ''}
+        <div class="s">${esc(i.note || '无备注')} · 用过 ${i.uses} 次</div></span>
+      ${i.revoked ? '' : `<button class="btn small" data-copy="${esc(i.code)}">复制</button><button class="btn small danger" data-off="${i.id}">停用</button>`}</div>`).join('')
+      : '<div class="empty small">还没有邀请码</div>'}</div>`, (el) => {
+    el.querySelector('#iv-add').onclick = async () => {
+      try { const r = await api('POST', '/api/admin/invites', { note: el.querySelector('#iv-note').value }); await copyText(inviteText(r.code), '已生成并复制，发给朋友吧'); invitesSheet(); }
+      catch (e) { toast(e.message, true); }
+    };
+    el.querySelectorAll('[data-copy]').forEach((b) => b.onclick = () => copyText(inviteText(b.dataset.copy), '已复制邀请文字'));
+    el.querySelectorAll('[data-off]').forEach((b) => b.onclick = async () => {
+      if (!confirm('停用这个邀请码？已经建好的游玩不受影响。')) return;
+      try { await api('DELETE', `/api/admin/invites/${b.dataset.off}`); toast('已停用'); invitesSheet(); } catch (e) { toast(e.message, true); }
+    });
+  });
+}
+
+const baseChips = (sel) => CURS.map((c) => `<button type="button" class="chip small-chip ${sel === c.key ? 'on' : ''}" data-base="${c.key}">${c.short}</button>`).join('');
+
+// 新建游玩：管理员直接建；朋友凭邀请码建
+async function newTripSheet(viaInvite) {
   let known = [];
-  try { known = (await api('GET', '/api/admin/people')).people; } catch {}
+  if (!viaInvite) { try { known = (await api('GET', '/api/admin/people')).people; } catch {} }
   const picked = new Set();
-  openSheet(`${sheetHead('新建游玩')}
+  let base = 'CNY';
+  openSheet(`${sheetHead(viaInvite ? '用邀请码新建游玩' : '新建游玩')}
     <form id="ntf">
+      ${viaInvite ? `<div class="field"><label>邀请码</label><input class="input num" name="code" autocomplete="off" autocapitalize="characters" placeholder="XXXXX-XXXXX" required></div>
+        <div class="field"><label>你的名字</label><input class="input" name="creator" maxlength="20" placeholder="会自动把你加进成员" required></div>` : ''}
       <div class="field"><label>去哪玩 / 叫什么</label><input class="input" name="name" maxlength="40" placeholder="例如：周末千岛湖" required></div>
       <div class="row2">
         <div class="field"><label>开始</label><input class="input" type="date" name="startDay" value="${S.today}" required></div>
         <div class="field"><label>结束（可空）</label><input class="input" type="date" name="endDay"></div>
       </div>
-      <div class="field"><div class="lab"><span>谁一起去</span><span class="faint">之后也能随时加人</span></div>
+      <div class="field"><div class="lab"><span>结算币种</span><span class="faint">分摊和转账都按它算</span></div><div class="chips" id="nt-base">${baseChips(base)}</div></div>
+      <div class="field"><div class="lab"><span>${viaInvite ? '还有谁一起去' : '谁一起去'}</span><span class="faint">之后也能随时加人</span></div>
         <div class="chips" id="nt-people"></div>
         <div class="row2" style="margin-top:8px"><input class="input" id="nt-name" maxlength="20" placeholder="输入名字，回车添加"><button type="button" class="btn" id="nt-add" style="flex:none">添加</button></div>
       </div>
       <div class="err"></div>
       <button class="btn primary block">创建并打开</button>
     </form>`, (el) => {
+    el.querySelector('#nt-base').onclick = (e) => { const b = e.target.closest('[data-base]'); if (b) { base = b.dataset.base; el.querySelector('#nt-base').innerHTML = baseChips(base); } };
     const box = el.querySelector('#nt-people');
     const names = [...known];
-    const draw = () => { box.innerHTML = names.map((n) => `<button type="button" class="chip ${picked.has(n) ? 'on' : ''}" data-n="${esc(n)}">${esc(n)}</button>`).join('') || '<span class="faint small">还没有人，下面输入名字添加</span>'; };
+    const draw = () => { box.innerHTML = names.map((n) => `<button type="button" class="chip ${picked.has(n) ? 'on' : ''}" data-n="${esc(n)}">${esc(n)}</button>`).join('') || '<span class="faint small">下面输入名字添加</span>'; };
     draw();
     box.onclick = (e) => { const b = e.target.closest('[data-n]'); if (!b) return; const n = b.dataset.n; picked.has(n) ? picked.delete(n) : picked.add(n); draw(); };
     const inp = el.querySelector('#nt-name');
@@ -308,8 +369,13 @@ async function newTripSheet() {
       e.preventDefault();
       if (inp.value.trim()) add();
       const f = new FormData(e.target);
+      const payload = { name: f.get('name'), startDay: f.get('startDay'), endDay: f.get('endDay') || null, members: [...picked], baseCurrency: base };
       try {
-        const r = await api('POST', '/api/admin/trips', { name: f.get('name'), startDay: f.get('startDay'), endDay: f.get('endDay') || null, members: [...picked] });
+        let r;
+        if (viaInvite) {
+          r = await api('POST', '/api/invite/trips', { ...payload, code: f.get('code'), creator: f.get('creator') });
+          if (r.meId) store.set('aa:me:' + r.key, String(r.meId));
+        } else r = await api('POST', '/api/admin/trips', payload);
         closeSheet(); go(`/t/${r.key}`);
         setTimeout(() => shareLink(true), 400);
       } catch (err) { el.querySelector('.err').textContent = err.message; }
@@ -323,8 +389,11 @@ async function newTripSheet() {
 async function loadTrip(first = false) {
   try {
     S.trip = await api('GET', `/api/t/${S.key}`);
+    BASE = S.trip.trip.base;
+    rememberTrip(S.key, S.trip.trip);
   } catch (e) {
-    $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">🔗</div>${esc(e.message)}${S.admin ? '<br><br><a href="/" data-link>返回首页</a>' : ''}</div></div>`;
+    if (e.status === 404) forgetTrip(S.key);
+    $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">🔗</div>${esc(e.message)}<br><br><a href="/" data-link>返回首页</a></div></div>`;
     return;
   }
   const saved = Number(store.get('aa:me:' + S.key));
@@ -360,14 +429,14 @@ function renderTrip() {
   const tabs = [['bills', '🧾', '账单'], ['settle', '💸', '结算'], ['stats', '📊', '统计'], ['people', '👥', '成员']];
   $app.innerHTML = `<div class="wrap">
     <div class="top">
-      ${S.admin ? '<a class="icon-btn" href="/" data-link aria-label="返回">‹</a>' : ''}
+      <a class="icon-btn" href="/" data-link aria-label="返回首页">‹</a>
       <h1>${esc(t.name)}</h1>
       <button class="chip-me" id="whoami">${me ? `我是 <b>${esc(me.name)}</b>` : '我是谁？'} ▾</button>
     </div>
     <div class="hero">
       <div class="label">一共花了</div>
       <div class="big num">${money(total)}</div>
-      <div class="meta">${range(t)} · ${d.members.length} 人</div>
+      <div class="meta">${range(t)} · ${d.members.length} 人${t.base !== 'CNY' ? ` · ${BN()}结算${t.toCny ? `，约合人民币 ${curMoney('CNY', Math.round(total * t.toCny))}` : ''}` : ''}</div>
       <div class="row">${mine}</div>
     </div>
     ${t.locked ? `<div class="banner lock">🔒<span class="sp">账单已锁定${t.lockedAt ? '（' + fmtTime(t.lockedAt) + '）' : ''}，只能查看${S.admin ? '' : '。需要改的话请找管理员解锁'}</span></div>` : ''}
@@ -426,7 +495,7 @@ function renderBills(body) {
     html += `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
-      const sub = `${e.currency !== 'CNY' ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
+      const sub = `${e.currency !== BASE ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
       html += `<button class="item" data-exp="${e.id}"><span class="cat">${CAT[e.category]?.icon || '📦'}</span>
         <span class="main"><span class="t">${esc(e.title || CAT[e.category]?.name || '其他')}</span><span class="s">${sub}</span></span>
         <span class="amt"><b class="num">${money(e.cents)}</b>${mineShare ? `<span class="num">我 ${money(mineShare.cents)}</span>` : S.me ? '<span>我不参与</span>' : ''}</span></button>`;
@@ -443,8 +512,8 @@ function expenseDetail(id) {
   const imgs = e.images.map((i) => `<button class="thumb" data-img="${i}"><img src="/api/t/${S.key}/images/${i}" alt="截图" loading="lazy"></button>`).join('');
   const mode = e.shares.some((s) => s.fixed != null) ? '含指定金额' : e.shares.every((s) => s.weight === e.shares[0].weight) ? '平均分' : '按份数';
   openSheet(`${sheetHead(e.title || CAT[e.category].name)}
-    <div style="font-size:32px;font-weight:700;margin:-6px 0 ${e.currency !== 'CNY' ? 0 : 10}px" class="num">${curMoney(e.currency, e.origCents)}</div>
-    ${e.currency !== 'CNY' ? `<div class="muted num" style="margin:0 0 12px">≈ ${money(e.cents)} 人民币 · ${e.cnyOverride ? '按实付人民币' : `1 ${CUR[e.currency].name} = ${fmtRate(e.rate)}`}</div>` : ''}
+    <div style="font-size:32px;font-weight:700;margin:-6px 0 ${e.currency !== BASE ? 0 : 10}px" class="num">${curMoney(e.currency, e.origCents)}</div>
+    ${e.currency !== BASE ? `<div class="muted num" style="margin:0 0 12px">≈ ${money(e.cents)} · ${e.baseOverride ? `按实付${BN()}` : `1 ${CUR[e.currency].name} = ${fmtRate(e.rate)}`}</div>` : ''}
     <div class="card">
       <div class="kv"><span>类别</span><span>${CAT[e.category]?.icon} ${CAT[e.category]?.name}</span></div>
       <div class="kv"><span>日期</span><span>${md(e.day)} ${wk(e.day)}</span></div>
@@ -452,7 +521,7 @@ function expenseDetail(id) {
       <div class="kv"><span>怎么分</span><span>${e.shares.length} 人 · ${mode}</span></div>
     </div>
     <div class="card"><h2>每人分摊</h2>
-      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== 'CNY' ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
+      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== BASE ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
     </div>
     ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
@@ -475,8 +544,8 @@ function expenseForm(exp) {
   if (!d.members.length) { toast('先在「成员」里加人', true); S.tab = 'people'; return renderTrip(); }
   const f = {
     amount: exp ? amountInput(exp.origCents) : '',
-    currency: exp?.currency || store.get('aa:cur:' + S.key) || 'CNY',
-    cny: exp?.cnyOverride ? amountInput(exp.cents) : '',
+    currency: exp?.currency || store.get('aa:cur:' + S.key) || BASE,
+    cny: exp?.baseOverride ? amountInput(exp.cents) : '',
     title: exp?.title || '', note: exp?.note || '',
     category: exp?.category || 'food',
     payerId: exp?.payerId ?? S.me ?? d.members[0].id,
@@ -511,22 +580,22 @@ function expenseForm(exp) {
     <div class="err" id="f-err"></div>
     <button class="btn primary block" id="f-save">${exp ? '保存修改' : '记下来'}</button>`, (el) => {
     const $ = (s) => el.querySelector(s);
-    const tripRate = () => (f.currency === 'CNY' ? 1 : d.rates[f.currency]?.rate);
+    const tripRate = () => (f.currency === BASE ? 1 : d.rates[f.currency]?.rate);
     const drawCur = () => {
       $('#f-cur').innerHTML = CURS.map((c) => `<button type="button" class="chip small-chip ${f.currency === c.key ? 'on' : ''}" data-cur="${c.key}">${c.short}</button>`).join('');
       $('#f-sym').textContent = CUR[f.currency].sym;
       $('#f-amount').style.paddingLeft = (CUR[f.currency].sym.length * 15 + 12) + 'px';
       const box = $('#f-fx');
-      if (f.currency === 'CNY') { box.innerHTML = ''; return preview(); }
+      if (f.currency === BASE) { box.innerHTML = ''; return preview(); }
       const tr = tripRate(), live = d.fx?.rates?.[f.currency];
       const name = CUR[f.currency].name;
       box.innerHTML = `<div class="fx-box">
-        ${tr ? `<div class="small">汇率：1 ${name} = <b>${fmtRate(tr)}</b> 人民币 <span class="faint">· 本次游玩统一汇率，可在「成员」页修改</span></div>`
+        ${tr ? `<div class="small">汇率：1 ${name} = <b>${fmtRate(tr)}</b> ${BN()} <span class="faint">· 本次游玩统一汇率，可在「成员」页修改</span></div>`
           : `<div class="field" style="margin:0"><label>汇率（第一次用${name}，之后本次游玩都按这个算）</label>
-              <div class="row2" style="align-items:center"><span class="small" style="flex:none">1 ${name} =</span><input class="input" id="f-rate" inputmode="decimal" value="${live ? fmtRate(live) : ''}" placeholder="例如 ${f.currency === 'JPY' ? '0.047' : '0.9'}"><span class="small" style="flex:none">人民币</span></div>
+              <div class="row2" style="align-items:center"><span class="small" style="flex:none">1 ${name} =</span><input class="input" id="f-rate" inputmode="decimal" value="${live ? fmtRate(live) : ''}" placeholder="例如 ${f.currency === 'JPY' ? '0.047' : '0.9'}"><span class="small" style="flex:none">${BN()}</span></div>
               <div class="faint tiny" style="margin-top:4px">${live ? `已填入今日市场汇率${d.fx.at ? '（' + fmtTime(d.fx.at) + ' 更新）' : ''}，可以改成你们实际换汇的汇率` : '暂时拿不到市场汇率，请手动填写'}</div></div>`}
-        <div class="field" style="margin:10px 0 0"><label>实付人民币（可选）</label>
-          <input class="input" id="f-cny" inputmode="decimal" placeholder="刷卡的话填账单上的人民币金额，以它为准" value="${esc(f.cny)}"></div>
+        <div class="field" style="margin:10px 0 0"><label>实付${BN()}（可选）</label>
+          <input class="input" id="f-cny" inputmode="decimal" placeholder="刷卡的话填账单上的${BN()}金额，以它为准" value="${esc(f.cny)}"></div>
       </div>`;
       const ri = $('#f-rate'); if (ri) ri.oninput = preview;
       $('#f-cny').oninput = (e) => { f.cny = e.target.value; preview(); };
@@ -547,13 +616,13 @@ function expenseForm(exp) {
         const p = f.parts.get(m.id);
         return `<div class="split-row" data-row="${m.id}"><span class="n">${esc(m.name)}</span>
           <input data-k="weight" inputmode="decimal" value="${esc(p.weight)}" aria-label="${esc(m.name)}的份数" ${p.fixed !== '' ? 'disabled' : ''}><span class="faint small">份</span>
-          <input class="money" data-k="fixed" inputmode="decimal" placeholder="${f.currency === 'CNY' ? '或金额' : '或' + CUR[f.currency].sym}" value="${esc(p.fixed)}" aria-label="${esc(m.name)}的指定金额">
+          <input class="money" data-k="fixed" inputmode="decimal" placeholder="${f.currency === BASE ? '或金额' : '或' + CUR[f.currency].sym}" value="${esc(p.fixed)}" aria-label="${esc(m.name)}的指定金额">
           <span class="r num" data-r></span></div>`;
       }).join('')}</div><p class="faint tiny" style="margin:6px 2px 0">填了金额的人按金额算，剩下的钱按份数分给其他人</p>` : '';
       preview();
     };
     const curRate = () => {
-      if (f.currency === 'CNY') return 1;
+      if (f.currency === BASE) return 1;
       const tr = tripRate(); if (tr) return tr;
       const v = String($('#f-rate')?.value ?? '').trim();
       return /^\d{1,4}(\.\d{1,8})?$/.test(v) && Number(v) > 0 ? Number(v) : null;
@@ -562,20 +631,20 @@ function expenseForm(exp) {
       const cents = parseCents($('#f-amount').value);
       if (!cents || !f.parts.size) return { cents, shares: null };
       let cny;
-      if (f.currency !== 'CNY' && String(f.cny).trim() !== '') {
+      if (f.currency !== BASE && String(f.cny).trim() !== '') {
         cny = parseCents(f.cny);
-        if (!cny) return { cents, error: '实付人民币金额不对' };
+        if (!cny) return { cents, error: `实付${BN()}金额不对` };
       } else {
         const rate = curRate();
         if (!rate) return { cents, error: '请填写汇率' };
-        cny = Math.round(cents * rate);
-        if (cny < 1) return { cents, error: '折合人民币不足 1 分' };
+        cny = roundTo(cents * rate, unitOf(BASE));
+        if (cny < 1) return { cents, error: `折合${BN()}金额太小` };
       }
       const parts = [];
       for (const [memberId, p] of f.parts) {
         if (f.detail && String(p.fixed).trim() !== '') {
           const fx = parseCents(p.fixed, true);
-          if (fx == null) return { cents, error: `${nameOf(memberId)} 的金额不对` };
+          if (fx == null || fx % unitOf(f.currency)) return { cents, error: `${nameOf(memberId)} 的金额不对` };
           parts.push({ memberId, weight: 0, fixed: fx });
         } else {
           const w = Number(p.weight);
@@ -583,7 +652,8 @@ function expenseForm(exp) {
           parts.push({ memberId, weight: w, fixed: null });
         }
       }
-      try { return { cents, cny, parts, shares: splitExpense(cents, cny, parts) }; }
+      if (cents % unitOf(f.currency)) return { cents, error: `${CUR[f.currency].name}金额不能有小数` };
+      try { return { cents, cny, parts, shares: splitExpense(cents, cny, parts, unitOf(f.currency), unitOf(BASE)) }; }
       catch (e) { return { cents, error: e.message }; }
     };
     const preview = () => {
@@ -592,9 +662,9 @@ function expenseForm(exp) {
       el.querySelectorAll('[data-r]').forEach((x) => { x.textContent = ''; });
       if (r.error) { pv.innerHTML = `<span class="neg">${esc(r.error)}</span>`; return; }
       if (!r.shares) { pv.textContent = f.parts.size ? '' : '至少选一个人'; return; }
-      const foreign = f.currency !== 'CNY';
+      const foreign = f.currency !== BASE;
       const one = (s) => foreign ? `${curMoney(f.currency, s.origCents)}（≈${money(s.cents)}）` : money(s.cents);
-      const head = foreign ? `折合人民币 <b>${money(r.cny)}</b>${String(f.cny).trim() ? '（按实付）' : ''}<br>` : '';
+      const head = foreign ? `折合${BN()} <b>${money(r.cny)}</b>${String(f.cny).trim() ? '（按实付）' : ''}<br>` : '';
       if (f.detail) {
         for (const s of r.shares) { const x = el.querySelector(`[data-row="${s.memberId}"] [data-r]`); if (x) x.textContent = foreign ? '≈' + money(s.cents) : money(s.cents); }
         pv.innerHTML = head;
@@ -671,8 +741,8 @@ function expenseForm(exp) {
         amount: $('#f-amount').value.trim(), title: $('#f-title').value, note: $('#f-note').value,
         category: f.category, payerId: f.payerId, day: $('#f-day').value,
         currency: f.currency,
-        rate: f.currency !== 'CNY' && !tripRate() ? $('#f-rate')?.value.trim() : undefined,
-        cny: f.currency !== 'CNY' ? String(f.cny).trim() || null : null,
+        rate: f.currency !== BASE && !tripRate() ? $('#f-rate')?.value.trim() : undefined,
+        baseAmount: f.currency !== BASE ? String(f.cny).trim() || null : null,
         shares: r.parts.map((p) => ({ memberId: p.memberId, weight: p.fixed != null ? 1 : p.weight, fixed: p.fixed != null ? amountInput(p.fixed) : null })),
       };
       try {
@@ -717,9 +787,10 @@ function renderSettle(body) {
         const to = member(x.toId);
         const hasCode = to && (to.codes.wechat || to.codes.alipay);
         const mine = S.me && (x.fromId === S.me || x.toId === S.me);
-        return `<div class="xfer ${mine ? 'me' : ''}"><div class="who"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
-          <div class="acts">${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
-      }).join('')}</div>`;
+        return `<div class="xfer ${mine ? 'me' : ''}"><div class="who" data-remind="${i}" role="button" tabindex="0" title="复制提醒文字"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
+          <div class="acts"><button class="btn small" data-remind="${i}" aria-label="复制提醒">📋</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
+      }).join('')}
+      <div style="padding:10px 16px 12px"><button class="btn block" id="remind-all">📋 复制催款消息（发到群里）</button></div></div>`;
   } else {
     html += `<div class="card done-big"><div class="e">🎉</div><b>已全部结清</b><span class="muted small">没有人欠钱了</span>
       ${editable() ? '<div style="margin-top:12px"><button class="btn primary" id="lock">锁定账单</button></div>' : ''}</div>`;
@@ -745,7 +816,29 @@ function renderSettle(body) {
     act(() => api('DELETE', `/api/t/${S.key}/payments/${b.dataset.undo}`), '已撤销').catch(() => {});
   });
   body.querySelector('#poster').onclick = posterSheet;
+  const ra = body.querySelector('#remind-all'); if (ra) ra.onclick = () => remindSheet(null);
+  body.querySelectorAll('[data-remind]').forEach((b) => b.onclick = () => remindSheet(d.transfers[Number(b.dataset.remind)]));
   body.querySelectorAll('#lock').forEach((b) => b.onclick = lockTrip);
+}
+
+// 催款文字：x 为空 = 发群里的汇总；否则 = 私聊提醒某一个人
+function remindText(x) {
+  const d = T(), t = d.trip, url = `${location.origin}/t/${S.key}`;
+  const total = d.expenses.reduce((a, e) => a + e.cents, 0);
+  const codeHint = (id) => { const m = member(id); return m && (m.codes.wechat || m.codes.alipay) ? '（链接里有收款码）' : ''; };
+  if (x) return `${nameOf(x.fromId)}，「${t.name}」的 AA 算好了：你需要转给 ${nameOf(x.toId)} ${money(x.cents)}${codeHint(x.toId)}。\n转完在链接里点一下「已转」就行：${url}`;
+  return `【${t.name}】AA 结算\n一共 ${money(total)}，${d.members.length} 人，${d.expenses.length} 笔\n还需要转账：\n`
+    + d.transfers.map((y) => `· ${nameOf(y.fromId)} → ${nameOf(y.toId)} ${money(y.cents)}`).join('\n')
+    + `\n明细、收款码都在这里，转完点「已转」：${url}`;
+}
+function remindSheet(x) {
+  const text = remindText(x);
+  openSheet(`${sheetHead(x ? `提醒 ${nameOf(x.fromId)}` : '催款消息')}
+    <div class="note-box" style="user-select:text">${esc(text)}</div>
+    <div class="btns" style="margin-top:12px"><button class="btn primary" id="rm-copy">复制</button>${navigator.share ? '<button class="btn" id="rm-share">分享…</button>' : ''}</div>`, (el) => {
+    el.querySelector('#rm-copy').onclick = async () => { if (await copyText(text, x ? '已复制，发给他吧' : '已复制，去群里粘贴吧')) closeSheet(); };
+    const sh = el.querySelector('#rm-share'); if (sh) sh.onclick = () => navigator.share({ text }).catch(() => {});
+  });
 }
 
 function paidSheet(x) {
@@ -817,7 +910,7 @@ function drawPoster() {
   const total = d.expenses.reduce((a, e) => a + e.cents, 0);
   const rows = d.balances.filter((b) => member(b.memberId));
   const cats = CATS.map((c) => ({ ...c, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents > 0).sort((a, b) => b.cents - a.cents);
-  const usedCurs = [...new Set(d.expenses.map((e) => e.currency))].filter((c) => c !== 'CNY' && d.rates[c]);
+  const usedCurs = [...new Set(d.expenses.map((e) => e.currency))].filter((c) => c !== BASE && d.rates[c]);
   const rateLine = usedCurs.length ? '汇率：' + usedCurs.map((c) => `1 ${CUR[c].name}=${fmtRate(d.rates[c].rate)}`).join('，') : '';
   // 先算高度
   const H = (rateLine ? 20 : 0) + 22 + 128 + 18 + (44 + rows.length * 34 + 12) + 18
@@ -902,7 +995,7 @@ function drawPoster() {
     y += h + 18;
   }
   if (rateLine) { text(rateLine, W / 2, y + 12, { size: 11.5, color: C.muted, align: 'center', max: W - 2 * P }); y += 20; }
-  text(`AA 账本 · 金额均为人民币 · 生成于 ${fmtTime(Date.now())}`, W / 2, y + 12, { size: 11.5, color: C.faint, align: 'center' });
+  text(`AA 账本 · 金额均为${BN()} · 生成于 ${fmtTime(Date.now())}`, W / 2, y + 12, { size: 11.5, color: C.faint, align: 'center' });
   return c;
 }
 
@@ -960,8 +1053,8 @@ function renderStats(body) {
     const list = d.expenses.filter((e) => e.currency === c.key);
     return { c, n: list.length, orig: list.reduce((a, e) => a + e.origCents, 0), cny: list.reduce((a, e) => a + e.cents, 0) };
   }).filter((x) => x.n);
-  if (byCur.length > 1 || (byCur[0] && byCur[0].c.key !== 'CNY')) {
-    html += `<div class="card"><h2>按币种<span class="sp"></span><small>统一折算成人民币</small></h2>${byCur.map((x) => `<div class="kv"><span>${x.c.name} <span class="faint tiny">${x.n} 笔</span></span><span class="num">${x.c.key === 'CNY' ? money(x.cny) : `${curMoney(x.c.key, x.orig)} <span class="faint">≈${money(x.cny)}</span>`}</span></div>`).join('')}</div>`;
+  if (byCur.length > 1 || (byCur[0] && byCur[0].c.key !== BASE)) {
+    html += `<div class="card"><h2>按币种<span class="sp"></span><small>统一折算成${BN()}</small></h2>${byCur.map((x) => `<div class="kv"><span>${x.c.name} <span class="faint tiny">${x.n} 笔</span></span><span class="num">${x.c.key === BASE ? money(x.cny) : `${curMoney(x.c.key, x.orig)} <span class="faint">≈${money(x.cny)}</span>`}</span></div>`).join('')}</div>`;
   }
 
   // 每天
@@ -977,7 +1070,7 @@ function renderStats(body) {
 
   // 最大的几笔
   const top = d.expenses.slice().sort((a, b) => b.cents - a.cents).slice(0, 5);
-  html += `<div class="card"><h2>最大的 ${top.length} 笔</h2>${top.map((e) => `<div class="kv" data-exp="${e.id}" style="cursor:pointer"><span>${CAT[e.category]?.icon} ${esc(e.title || CAT[e.category]?.name)} <span class="faint tiny">${md(e.day)} · ${esc(nameOf(e.payerId))} 付${e.currency !== 'CNY' ? ' · ' + esc(curMoney(e.currency, e.origCents)) : ''}</span></span><span class="num">${money(e.cents)}</span></div>`).join('')}</div>`;
+  html += `<div class="card"><h2>最大的 ${top.length} 笔</h2>${top.map((e) => `<div class="kv" data-exp="${e.id}" style="cursor:pointer"><span>${CAT[e.category]?.icon} ${esc(e.title || CAT[e.category]?.name)} <span class="faint tiny">${md(e.day)} · ${esc(nameOf(e.payerId))} 付${e.currency !== BASE ? ' · ' + esc(curMoney(e.currency, e.origCents)) : ''}</span></span><span class="num">${money(e.cents)}</span></div>`).join('')}</div>`;
 
   // 谁垫钱最多
   const payer = rows.slice().sort((a, b) => b.paid - a.paid)[0];
@@ -1003,8 +1096,10 @@ function renderPeople(body) {
   html += `<div class="section-title"><span>这次游玩</span></div>
     <div class="list">
       <button class="item" id="pm-share"><span class="cat">🔗</span><span class="main"><span class="t">分享链接</span><span class="s">发到群里，大家打开就能记账</span></span></button>
+      <button class="item" id="pm-base"><span class="cat">🪙</span><span class="main"><span class="t">结算币种：${BN()}</span><span class="s">${ed ? (d.payments.length ? '已有转账记录，不能再换' : '分摊和转账都按它算，点击更换') : '分摊和转账都按它算'}</span></span></button>
       ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
-      ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} 人民币</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
+      ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} ${BN()}</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
+      <a class="item" id="pm-export" href="/api/t/${esc(S.key)}/export" download><span class="cat">📑</span><span class="main"><span class="t">导出 Excel</span><span class="s">账目明细、每人汇总、转账记录</span></span></a>
       <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔</span></span></button>
       ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
     </div>
@@ -1029,6 +1124,7 @@ function renderPeople(body) {
   }
   body.querySelector('#pm-share').onclick = () => shareLink(false);
   body.querySelector('#pm-log').onclick = logSheet;
+  if (ed && !d.payments.length) body.querySelector('#pm-base').onclick = baseSheet;
   if (ed) body.querySelectorAll('[data-rate]').forEach((b) => b.onclick = () => rateSheet(b.dataset.rate));
   const pe = body.querySelector('#pm-edit'); if (pe) pe.onclick = tripEditSheet;
   const pl = body.querySelector('#pm-lock'); if (pl) pl.onclick = lockTrip;
@@ -1048,13 +1144,43 @@ function renderPeople(body) {
   };
 }
 
+function baseSheet() {
+  const d = T(), from = BASE;
+  let to = from;
+  openSheet(`${sheetHead('更换结算币种')}
+    <p class="muted small" style="margin-top:-6px">换了以后，所有账目都会按新币种重新折算，分摊和转账也都用新币种。</p>
+    <div class="chips" id="bs-cur">${baseChips(to)}</div>
+    <div id="bs-rate" style="margin-top:14px"></div>
+    <div class="err"></div><button class="btn primary block" id="bs-save" disabled>更换并重算</button>`, (el) => {
+    const draw = () => {
+      el.querySelector('#bs-cur').innerHTML = baseChips(to);
+      const box = el.querySelector('#bs-rate');
+      el.querySelector('#bs-save').disabled = to === from;
+      if (to === from) { box.innerHTML = ''; return; }
+      const live = d.fx?.rates?.[to] ? 1 / d.fx.rates[to] : null; // 1 旧 = ? 新
+      box.innerHTML = `<div class="field"><label>换算汇率</label>
+        <div class="row2" style="align-items:center"><span style="flex:none">1 ${CUR[from].name} =</span><input class="input" id="bs-v" inputmode="decimal" value="${live ? fmtRate(live) : ''}"><span style="flex:none">${CUR[to].name}</span></div>
+        <div class="faint tiny" style="margin-top:4px">${live ? '已填入今日市场汇率，可以改' : '暂时拿不到市场汇率，请手动填写'}。其他外币的汇率会自动跟着换算。</div></div>`;
+    };
+    draw();
+    el.querySelector('#bs-cur').onclick = (e) => { const b = e.target.closest('[data-base]'); if (b) { to = b.dataset.base; draw(); } };
+    el.querySelector('#bs-save').onclick = async () => {
+      try {
+        const r = await api('PUT', `/api/t/${S.key}/base`, { currency: to, rate: el.querySelector('#bs-v')?.value.trim() });
+        store.set('aa:cur:' + S.key, null);
+        closeSheet(); toast(`已换成${CUR[to].name}，重算了 ${r.recomputed} 笔`); await refresh();
+      } catch (e) { el.querySelector('.err').textContent = e.message; }
+    };
+  });
+}
+
 function rateSheet(cur) {
   const d = T(), r = d.rates[cur], live = d.fx?.rates?.[cur], name = CUR[cur].name;
-  const n = d.expenses.filter((e) => e.currency === cur && !e.cnyOverride).length;
+  const n = d.expenses.filter((e) => e.currency === cur && !e.baseOverride).length;
   openSheet(`${sheetHead(`${name}汇率`)}
-    <div class="row2" style="align-items:center"><span style="flex:none">1 ${name} =</span><input class="input" id="rt-v" inputmode="decimal" value="${fmtRate(r.rate)}"><span style="flex:none">人民币</span></div>
+    <div class="row2" style="align-items:center"><span style="flex:none">1 ${name} =</span><input class="input" id="rt-v" inputmode="decimal" value="${fmtRate(r.rate)}"><span style="flex:none">${BN()}</span></div>
     ${live ? `<button class="btn ghost small" id="rt-live" style="margin-top:6px">用今日市场汇率 ${fmtRate(live)}</button>` : ''}
-    <p class="muted small">保存后，本次游玩里 ${n} 笔${name}账目会按新汇率重新折算（填了「实付人民币」的不受影响）。已标记的转账不会变，结算方案会自动更新。</p>
+    <p class="muted small">保存后，本次游玩里 ${n} 笔${name}账目会按新汇率重新折算（填了「实付${BN()}」的不受影响）。已标记的转账不会变，结算方案会自动更新。</p>
     <div class="err"></div><button class="btn primary block" id="rt-save">保存并重算</button>`, (el) => {
     const lv = el.querySelector('#rt-live'); if (lv) lv.onclick = () => { el.querySelector('#rt-v').value = fmtRate(live); };
     el.querySelector('#rt-save').onclick = async () => {

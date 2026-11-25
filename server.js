@@ -6,7 +6,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
-const { settle, splitExpense } = require('./public/settle');
+const { settle, splitExpense, unitOf, roundTo } = require('./public/settle');
+const { buildXlsx } = require('./xlsx');
 
 const PORT = Number(process.env.PORT || 8792);
 const HOST = '127.0.0.1';
@@ -46,7 +47,7 @@ function cleanText(v, max) {
   return String(v ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim().slice(0, max);
 }
 const CATEGORIES = { food: '餐饮', transport: '交通', lodging: '住宿', ticket: '门票', fun: '娱乐', shopping: '购物', other: '其他' };
-// 支持的币种。结算统一折算成人民币
+// 支持的币种。每次游玩选一个结算币种（默认人民币），其他币种按汇率折算成它
 const CURRENCIES = {
   CNY: { name: '人民币', sym: '¥' }, HKD: { name: '港币', sym: 'HK$' }, TWD: { name: '新台币', sym: 'NT$' },
   JPY: { name: '日元', sym: 'JP¥' }, SGD: { name: '新加坡元', sym: 'S$' }, MYR: { name: '马来西亚令吉', sym: 'RM' },
@@ -84,6 +85,19 @@ async function liveRates() {
   return { rates: n.rates, at: n.at };
 }
 const fmtY = (c) => '¥' + (c / 100).toFixed(c % 100 ? 2 : 0);
+// 交叉汇率：1 单位 from 折合多少 to（市场汇率缓存里都是"折合人民币"）
+function crossRate(live, from, to) {
+  if (from === to) return 1;
+  const f = from === 'CNY' ? 1 : live.rates[from], t = to === 'CNY' ? 1 : live.rates[to];
+  return f && t ? Number((f / t).toFixed(8)) : null;
+}
+// 结算币种 → 人民币的折算系数（年度统计用）：优先用这次游玩里设定的人民币汇率，否则用市场汇率
+function toCnyFactor(base, tripRates, live) {
+  if (base === 'CNY') return 1;
+  const r = tripRates.find((x) => x.currency === 'CNY');
+  if (r) return 1 / r.rate;
+  return crossRate(live, base, 'CNY') || 0;
+}
 const newKey = () => crypto.randomBytes(16).toString('base64url'); // 22 位
 
 function hashPassword(pw) {
@@ -221,11 +235,13 @@ async function tripPayload(trip, admin) {
     db.query(`SELECT c.person_id, c.kind, c.updated_at FROM pay_codes c JOIN members m ON m.person_id=c.person_id WHERE m.trip_id=$1`, [trip.id]),
     db.query(`SELECT currency, rate::float AS rate, updated_at FROM trip_rates WHERE trip_id=$1`, [trip.id]),
   ]);
+  const base = trip.base_currency;
+  const live = await liveRates();
   const byExp = new Map(exps.map((e) => [e.id, { shares: [], images: [] }]));
   for (const s of shares) byExp.get(s.expense_id)?.shares.push({ memberId: s.member_id, weight: s.weight, fixed: s.fixed_cents, origCents: s.orig_cents, cents: s.cents });
   for (const i of imgs) byExp.get(i.expense_id)?.images.push(i.id);
   const expenses = exps.map((e) => ({
-    id: e.id, payerId: e.payer_id, cents: e.cents, currency: e.currency, origCents: e.orig_cents, rate: e.rate, cnyOverride: e.cny_override, category: e.category, title: e.title, note: e.note, day: e.day,
+    id: e.id, payerId: e.payer_id, cents: e.cents, currency: e.currency, origCents: e.orig_cents, rate: e.rate, baseOverride: e.cny_override, category: e.category, title: e.title, note: e.note, day: e.day,
     createdBy: e.created_by, createdAt: e.created_at, updatedAt: e.updated_at, ...byExp.get(e.id),
   }));
   const payments = pays.map((p) => ({ id: p.id, fromId: p.from_id, toId: p.to_id, cents: p.cents, createdBy: p.created_by, createdAt: p.created_at }));
@@ -233,11 +249,14 @@ async function tripPayload(trip, admin) {
   const codeMap = {};
   for (const c of codes) (codeMap[c.person_id] ||= {})[c.kind] = new Date(c.updated_at).getTime();
   return {
-    trip: { id: trip.id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at },
+    trip: { id: trip.id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at,
+      base, toCny: toCnyFactor(base, rates, live) },
     members: members.map((m) => ({ id: m.id, name: m.name, weight: m.weight, codes: codeMap[m.person_id] || {} })),
     expenses, payments, balances, transfers,
     rates: Object.fromEntries(rates.map((r) => [r.currency, { rate: r.rate, updatedAt: r.updated_at }])),
-    fx: await liveRates(), currencies: CURRENCIES,
+    // 市场参考汇率（已换算成"1 单位 X = ? 结算币种"）
+    fx: { at: live.at, rates: Object.fromEntries(Object.keys(CURRENCIES).filter((c) => c !== base).map((c) => [c, crossRate(live, c, base)]).filter(([, r]) => r)) },
+    currencies: CURRENCIES,
     isAdmin: !!admin, today: todayStr(), categories: CATEGORIES,
   };
 }
@@ -373,12 +392,14 @@ route('GET', '/api/t/:key/paycode/:id/:kind', async ({ params }) => {
 
 // ---------- 账目 ----------
 // 校验并算出每人分摊。返回 { payer, cents, category, title, note, day, shares:[{memberId,weight,fixed,cents}] }
-// 校验并算出每人分摊。rate = 1 单位原币折合多少人民币（人民币为 1）
-// 返回 { payer, currency, origCents, rate, cnyOverride, cents, category, title, note, day, shares }
-function parseExpense(body, mm, today, rate) {
-  const currency = CURRENCIES[body.currency] ? body.currency : 'CNY';
+// 校验并算出每人分摊。rate = 1 单位原币折合多少结算币种（同币种为 1）
+// 返回 { payer, currency, origCents, rate, baseOverride, cents, category, title, note, day, shares }
+function parseExpense(body, mm, today, rate, base) {
+  const currency = CURRENCIES[body.currency] ? body.currency : base;
   const origCents = parseAmount(body.amount);
   if (!origCents) throw bad('金额不对（最多两位小数）');
+  const ou = unitOf(currency), bu = unitOf(base);
+  if (origCents % ou) throw bad(`${CURRENCIES[currency].name}金额不能有小数`);
   const payer = mm.get(Number(body.payerId));
   if (!payer) throw bad('请选择谁付的钱');
   const category = CATEGORIES[body.category] ? body.category : 'other';
@@ -388,15 +409,16 @@ function parseExpense(body, mm, today, rate) {
   if (!validDay(day)) throw bad('日期不对');
   if (!Array.isArray(body.shares) || !body.shares.length) throw bad('至少选一个人分摊');
   if (body.shares.length > 50) throw bad('分摊的人太多了');
-  // 外币可以直接填"实付人民币"（如信用卡账单金额），这时不按汇率算
-  let cents, cnyOverride = false;
-  if (currency !== 'CNY' && body.cny != null && String(body.cny).trim() !== '') {
-    cents = parseAmount(body.cny);
-    if (!cents) throw bad('实付人民币金额不对');
-    cnyOverride = true;
+  // 外币可以直接填"实付结算币种金额"（如信用卡账单金额），这时不按汇率算
+  const paid = body.baseAmount ?? body.cny;
+  let cents, baseOverride = false;
+  if (currency !== base && paid != null && String(paid).trim() !== '') {
+    cents = parseAmount(paid);
+    if (!cents || cents % bu) throw bad(`实付${CURRENCIES[base].name}金额不对`);
+    baseOverride = true;
   } else {
-    cents = Math.round(origCents * rate);
-    if (cents < 1) throw bad('折合人民币不足 1 分');
+    cents = roundTo(origCents * rate, bu);
+    if (cents < 1) throw bad(`折合${CURRENCIES[base].name}金额太小`);
   }
   const seen = new Set();
   const parts = body.shares.map((s) => {
@@ -406,7 +428,7 @@ function parseExpense(body, mm, today, rate) {
     const name = mm.get(memberId).name;
     if (s.fixed != null && s.fixed !== '') {
       const fixed = parseAmount(s.fixed, true);
-      if (fixed == null) throw bad(`${name} 的指定金额不对`);
+      if (fixed == null || fixed % ou) throw bad(`${name} 的指定金额不对`);
       return { memberId, weight: 0, fixed };
     }
     const weight = parseWeight(s.weight ?? 1);
@@ -414,12 +436,12 @@ function parseExpense(body, mm, today, rate) {
     return { memberId, weight, fixed: null };
   });
   let shares;
-  try { shares = splitExpense(origCents, cents, parts); } catch (e) { if (e.status === 400) throw bad(e.message); throw e; }
-  return { payer, currency, origCents, rate: cnyOverride ? origCents && cents / origCents : rate, cnyOverride, cents, category, title, note, day, shares };
+  try { shares = splitExpense(origCents, cents, parts, ou, bu); } catch (e) { if (e.status === 400) throw bad(e.message); throw e; }
+  return { payer, currency, origCents, rate: baseOverride ? Number((cents / origCents).toFixed(8)) : rate, baseOverride, cents, category, title, note, day, shares };
 }
 const fmtMoney = (cur, c) => cur === 'CNY' ? fmtY(c) : `${CURRENCIES[cur].sym}${(c / 100).toFixed(c % 100 ? 2 : 0)}`;
-function describeExp(e, mm) {
-  const amt = e.currency && e.currency !== 'CNY' ? `${fmtMoney(e.currency, e.origCents)}（≈${fmtY(e.cents)}）` : fmtY(e.cents);
+function describeExp(e, mm, base) {
+  const amt = e.currency && e.currency !== base ? `${fmtMoney(e.currency, e.origCents)}（≈${fmtMoney(base, e.cents)}）` : fmtMoney(base, e.cents);
   return `${e.day.slice(5).replace('-', '/')} ${e.title || CATEGORIES[e.category]} ${amt}（${mm.get(e.payerId ?? e.payer.id)?.name ?? '?'} 付，${e.shares.length} 人分）`;
 }
 async function writeShares(q, expenseId, shares) {
@@ -444,16 +466,17 @@ function parseRate(v) {
   return Number(s);
 }
 async function tripRate(q, trip, currency, bodyRate, actor) {
-  if (currency === 'CNY' || !CURRENCIES[currency]) return 1;
+  const base = trip.base_currency;
+  if (!CURRENCIES[currency] || currency === base) return 1;
   const { rows: [r] } = await q.query(`SELECT rate::float AS rate FROM trip_rates WHERE trip_id=$1 AND currency=$2`, [trip.id, currency]);
   if (r) return r.rate;
   let rate = bodyRate != null && bodyRate !== '' ? parseRate(bodyRate) : null;
   if (bodyRate != null && bodyRate !== '' && !rate) throw bad('汇率不对');
-  if (!rate) rate = (await liveRates()).rates[currency];
+  if (!rate) rate = crossRate(await liveRates(), currency, base);
   if (!rate) throw bad(`暂时拿不到${CURRENCIES[currency].name}汇率，请手动填写`);
   rate = Number(rate.toFixed(8));
   await q.query(`INSERT INTO trip_rates(trip_id,currency,rate) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, [trip.id, currency, rate]);
-  await log(q, trip.id, actor, 'rate.set', `设定汇率：1 ${CURRENCIES[currency].name} = ${rate} 人民币`);
+  await log(q, trip.id, actor, 'rate.set', `设定汇率：1 ${CURRENCIES[currency].name} = ${rate} ${CURRENCIES[base].name}`);
   return rate;
 }
 
@@ -464,12 +487,12 @@ route('POST', '/api/t/:key/expenses', async ({ params, body, req, admin }) => {
     const mm = await memberMap(q, trip.id);
     const actor = await actorName(q, trip, req, admin);
     const rate = await tripRate(q, trip, body.currency, body.rate, actor);
-    const e = parseExpense(body, mm, todayStr(), rate);
+    const e = parseExpense(body, mm, todayStr(), rate, trip.base_currency);
     const { rows: [r] } = await q.query(`INSERT INTO expenses(trip_id,payer_id,cents,category,title,note,day,created_by,currency,orig_cents,rate,cny_override)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-      [trip.id, e.payer.id, e.cents, e.category, e.title, e.note, e.day, actor, e.currency, e.origCents, e.rate, e.cnyOverride]);
+      [trip.id, e.payer.id, e.cents, e.category, e.title, e.note, e.day, actor, e.currency, e.origCents, e.rate, e.baseOverride]);
     await writeShares(q, r.id, e.shares);
-    await log(q, trip.id, actor, 'expense.add', `记了一笔：${describeExp(e, mm)}`);
+    await log(q, trip.id, actor, 'expense.add', `记了一笔：${describeExp(e, mm, trip.base_currency)}`);
     return { id: r.id };
   });
 });
@@ -481,21 +504,21 @@ route('PUT', '/api/t/:key/expenses/:id', async ({ params, body, req, admin }) =>
     const actor = await actorName(q, trip, req, admin);
     const old = await loadExpense(q, trip, params.id);
     const rate = await tripRate(q, trip, body.currency, body.rate, actor);
-    const e = parseExpense(body, mm, todayStr(), rate);
+    const e = parseExpense(body, mm, todayStr(), rate, trip.base_currency);
     await q.query(`UPDATE expenses SET payer_id=$1,cents=$2,category=$3,title=$4,note=$5,day=$6,currency=$7,orig_cents=$8,rate=$9,cny_override=$10,updated_at=now() WHERE id=$11`,
-      [e.payer.id, e.cents, e.category, e.title, e.note, e.day, e.currency, e.origCents, e.rate, e.cnyOverride, old.id]);
+      [e.payer.id, e.cents, e.category, e.title, e.note, e.day, e.currency, e.origCents, e.rate, e.baseOverride, old.id]);
     await writeShares(q, old.id, e.shares);
-    await log(q, trip.id, actor, 'expense.edit', `修改了一笔：${describeExp(old, mm)} → ${describeExp(e, mm)}`);
+    await log(q, trip.id, actor, 'expense.edit', `修改了一笔：${describeExp(old, mm, trip.base_currency)} → ${describeExp(e, mm, trip.base_currency)}`);
     return { id: old.id };
   });
 });
 
-// 修改这次游玩某币种的汇率：该币种所有（没填实付人民币的）账目按新汇率重算
+// 修改这次游玩某币种的汇率：该币种所有（没填实付金额的）账目按新汇率重算
 route('PUT', '/api/t/:key/rates/:cur', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const cur = params.cur;
-  if (!CURRENCIES[cur] || cur === 'CNY') throw bad('币种不对');
+  if (!CURRENCIES[cur] || cur === trip.base_currency) throw bad('币种不对');
   const rate = parseRate(body.rate);
   if (!rate) throw bad('汇率不对');
   return tx(async (q) => {
@@ -504,19 +527,103 @@ route('PUT', '/api/t/:key/rates/:cur', async ({ params, body, req, admin }) => {
       ON CONFLICT (trip_id,currency) DO UPDATE SET rate=EXCLUDED.rate, updated_at=now()`, [trip.id, cur, rate]);
     const { rows: exps } = await q.query(`SELECT id, orig_cents FROM expenses WHERE trip_id=$1 AND currency=$2 AND NOT cny_override`, [trip.id, cur]);
     for (const e of exps) {
-      const cents = Math.max(1, Math.round(e.orig_cents * rate));
+      const bu = unitOf(trip.base_currency);
+      const cents = Math.max(bu, roundTo(e.orig_cents * rate, bu));
       const { rows: sh } = await q.query(`SELECT member_id, weight::float AS weight, fixed_cents FROM expense_shares WHERE expense_id=$1 ORDER BY member_id`, [e.id]);
       // 按原来的录入顺序无关紧要：分摊只取决于份数/指定金额
-      const shares = splitExpense(e.orig_cents, cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })));
+      const shares = splitExpense(e.orig_cents, cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })), unitOf(cur), bu);
       await q.query(`UPDATE expenses SET cents=$1, rate=$2 WHERE id=$3`, [cents, rate, e.id]);
       await writeShares(q, e.id, shares);
     }
     await log(q, trip.id, await actorName(q, trip, req, admin), 'rate.edit',
-      `把汇率改为 1 ${CURRENCIES[cur].name} = ${rate} 人民币${old ? `（原 ${old.rate}）` : ''}，重算了 ${exps.length} 笔`);
+      `把汇率改为 1 ${CURRENCIES[cur].name} = ${rate} ${CURRENCIES[trip.base_currency].name}${old ? `（原 ${old.rate}）` : ''}，重算了 ${exps.length} 笔`);
     return { ok: true, recomputed: exps.length };
   });
 });
 route('GET', '/api/fx', async () => liveRates());
+
+// 更换结算币种：所有账目换算到新币种。已有转账记录时不允许（避免转账金额换算出零头）
+// body.rate = 1 旧结算币种 = ? 新结算币种（不填就用市场汇率）
+route('PUT', '/api/t/:key/base', async ({ params, body, req, admin }) => {
+  const trip = await loadTrip(params.key);
+  assertOpen(trip);
+  const from = trip.base_currency, to = body.currency;
+  if (!CURRENCIES[to]) throw bad('币种不对');
+  if (to === from) return { ok: true, recomputed: 0 };
+  return tx(async (q) => {
+    const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM payments WHERE trip_id=$1`, [trip.id]);
+    if (n) throw bad('已经有转账记录了，不能再换结算币种。先撤销所有「已转」再试');
+    const conv = body.rate != null && body.rate !== '' ? parseRate(body.rate) : crossRate(await liveRates(), from, to);
+    if (!conv) throw bad('汇率不对');
+    // 新的各币种汇率：X→新 = X→旧 × 旧→新；旧结算币种自己 = conv；新结算币种不再需要汇率
+    const { rows: old } = await q.query(`SELECT currency, rate::float AS rate FROM trip_rates WHERE trip_id=$1`, [trip.id]);
+    const newRates = new Map(old.filter((r) => r.currency !== to).map((r) => [r.currency, Number((r.rate * conv).toFixed(8))]));
+    newRates.set(from, conv);
+    await q.query(`DELETE FROM trip_rates WHERE trip_id=$1`, [trip.id]);
+    for (const [c, r] of newRates) await q.query(`INSERT INTO trip_rates(trip_id,currency,rate) VALUES($1,$2,$3)`, [trip.id, c, r]);
+    const { rows: exps } = await q.query(`SELECT id, currency, orig_cents, cents, cny_override FROM expenses WHERE trip_id=$1`, [trip.id]);
+    const bu = unitOf(to);
+    for (const e of exps) {
+      let cents, rate, override = e.cny_override;
+      if (e.currency === to) { cents = e.orig_cents; rate = 1; override = false; }
+      else if (override) { cents = Math.max(bu, roundTo(e.cents * conv, bu)); rate = Number((cents / e.orig_cents).toFixed(8)); }
+      else { rate = newRates.get(e.currency); cents = Math.max(bu, roundTo(e.orig_cents * rate, bu)); }
+      const { rows: sh } = await q.query(`SELECT member_id, weight::float AS weight, fixed_cents FROM expense_shares WHERE expense_id=$1 ORDER BY member_id`, [e.id]);
+      const shares = splitExpense(e.orig_cents, cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })), unitOf(e.currency), bu);
+      await q.query(`UPDATE expenses SET cents=$1, rate=$2, cny_override=$3 WHERE id=$4`, [cents, rate, override, e.id]);
+      await writeShares(q, e.id, shares);
+    }
+    await q.query(`UPDATE trips SET base_currency=$1 WHERE id=$2`, [to, trip.id]);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.base',
+      `把结算币种从${CURRENCIES[from].name}改为${CURRENCIES[to].name}（1 ${CURRENCIES[from].name} = ${conv} ${CURRENCIES[to].name}），重算了 ${exps.length} 笔`);
+    return { ok: true, recomputed: exps.length };
+  });
+});
+
+// 导出 Excel
+route('GET', '/api/t/:key/export', async ({ params, admin }) => {
+  const trip = await loadTrip(params.key);
+  const d = await tripPayload(trip, admin);
+  const base = trip.base_currency, B = CURRENCIES[base].name;
+  const name = new Map(d.members.map((m) => [m.id, m.name]));
+  const Y = (c) => Math.round(c) / 100;
+  const exps = d.expenses.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.id - b.id));
+  const sheets = [];
+  sheets.push({
+    name: '账目明细',
+    columns: [{ header: '日期', width: 11 }, { header: '类别', width: 7 }, { header: '内容', width: 18 }, { header: '付款人', width: 9 },
+      { header: '币种', width: 8 }, { header: '原币金额', width: 12, type: 'money' }, { header: '汇率', width: 10 },
+      { header: `金额（${B}）`, width: 13, type: 'money' },
+      ...d.members.map((m) => ({ header: `${m.name} 应摊`, width: 11, type: 'money' })),
+      { header: '备注', width: 24 }, { header: '记录人', width: 9 }],
+    rows: exps.map((e) => [e.day, CATEGORIES[e.category], e.title, name.get(e.payerId) || '', CURRENCIES[e.currency]?.name || e.currency, Y(e.origCents),
+      e.currency === base ? '' : e.baseOverride ? '按实付' : String(e.rate), Y(e.cents),
+      ...d.members.map((m) => { const sh = e.shares.find((x) => x.memberId === m.id); return sh ? Y(sh.cents) : null; }),
+      e.note, e.createdBy]),
+    totalRow: ['合计', '', '', '', '', null, '', Y(exps.reduce((a, e) => a + e.cents, 0)),
+      ...d.members.map((m) => Y(exps.reduce((a, e) => a + (e.shares.find((x) => x.memberId === m.id)?.cents || 0), 0))), '', ''],
+  });
+  sheets.push({
+    name: '每人汇总',
+    columns: [{ header: '成员', width: 10 }, { header: `垫付（${B}）`, width: 13, type: 'money' }, { header: `应摊（${B}）`, width: 13, type: 'money' },
+      { header: '已转出', width: 11, type: 'money' }, { header: '已收到', width: 11, type: 'money' }, { header: '还应收(+)/应付(-)', width: 16, type: 'money' }],
+    rows: d.balances.filter((b) => name.has(b.memberId)).map((b) => [name.get(b.memberId), Y(b.paid), Y(b.share), Y(b.sent), Y(b.received), Y(b.net)]),
+  });
+  sheets.push({
+    name: '转账',
+    columns: [{ header: '状态', width: 8 }, { header: '付款人', width: 10 }, { header: '收款人', width: 10 }, { header: `金额（${B}）`, width: 13, type: 'money' }, { header: '时间', width: 17 }],
+    rows: [...d.payments.map((p) => ['已转', name.get(p.fromId), name.get(p.toId), Y(p.cents), new Date(p.createdAt).toLocaleString('zh-CN', { timeZone: TZ, hour12: false })]),
+      ...d.transfers.map((t) => ['待转', name.get(t.fromId), name.get(t.toId), Y(t.cents), ''])],
+  });
+  const rates = Object.entries(d.rates);
+  if (rates.length) sheets.push({
+    name: '汇率',
+    columns: [{ header: '币种', width: 12 }, { header: `1 单位折合${B}`, width: 16 }],
+    rows: rates.map(([c, r]) => [CURRENCIES[c]?.name || c, String(r.rate)]),
+  });
+  return { __file: { name: `AA账本_${trip.name}.xlsx`, data: buildXlsx(sheets), type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } };
+});
+
 
 route('DELETE', '/api/t/:key/expenses/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
@@ -526,7 +633,7 @@ route('DELETE', '/api/t/:key/expenses/:id', async ({ params, req, admin }) => {
     const old = await loadExpense(q, trip, params.id);
     const { rows } = await q.query(`SELECT file FROM images WHERE expense_id=$1`, [old.id]);
     await q.query(`DELETE FROM expenses WHERE id=$1`, [old.id]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'expense.remove', `删除了一笔：${describeExp(old, mm)}`);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'expense.remove', `删除了一笔：${describeExp(old, mm, trip.base_currency)}`);
     return rows.map((r) => r.file);
   });
   removeFiles(files);
@@ -543,7 +650,7 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
     const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
     if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`每笔最多 ${MAX_IMAGES_PER_EXPENSE} 张图`);
     const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes) VALUES($1,$2,$3,$4) RETURNING id`, [e.id, img.file, img.mime, img.bytes]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtY(e.cents)}」加了一张图`);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtMoney(trip.base_currency, e.cents)}」加了一张图`);
     return { id: r.id };
   }).catch((err) => { removeFiles([img.file]); throw err; });
 }, { raw: true });
@@ -554,7 +661,7 @@ route('DELETE', '/api/t/:key/images/:id', async ({ params, req, admin }) => {
     const { rows: [i] } = await q.query(`SELECT i.id, i.file, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
     if (!i) throw new HttpError(404, '图片不存在');
     await q.query(`DELETE FROM images WHERE id=$1`, [i.id]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.remove', `删除了「${i.title || CATEGORIES[i.category]} ${fmtY(i.cents)}」的一张图`);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.remove', `删除了「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」的一张图`);
     return i.file;
   });
   removeFiles([file]);
@@ -576,11 +683,11 @@ route('POST', '/api/t/:key/payments', async ({ params, body, req, admin }) => {
     const from = mm.get(Number(body.fromId)), to = mm.get(Number(body.toId));
     if (!from || !to || from.id === to.id) throw bad('转账双方不对');
     const cents = parseAmount(body.amount);
-    if (!cents) throw bad('金额不对');
+    if (!cents || cents % unitOf(trip.base_currency)) throw bad('金额不对');
     const actor = await actorName(q, trip, req, admin);
     const { rows: [r] } = await q.query(`INSERT INTO payments(trip_id,from_id,to_id,cents,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id`,
       [trip.id, from.id, to.id, cents, actor]);
-    await log(q, trip.id, actor, 'payment.add', `标记 ${from.name} 已转给 ${to.name} ${fmtY(cents)}`);
+    await log(q, trip.id, actor, 'payment.add', `标记 ${from.name} 已转给 ${to.name} ${fmtMoney(trip.base_currency, cents)}`);
     return { id: r.id };
   });
 });
@@ -591,7 +698,7 @@ route('DELETE', '/api/t/:key/payments/:id', async ({ params, req, admin }) => {
     const mm = await memberMap(q, trip.id);
     const { rows: [p] } = await q.query(`DELETE FROM payments WHERE id=$1 AND trip_id=$2 RETURNING *`, [params.id, trip.id]);
     if (!p) throw new HttpError(404, '这条转账不存在');
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'payment.remove', `撤销了「${mm.get(p.from_id)?.name} 转给 ${mm.get(p.to_id)?.name} ${fmtY(p.cents)}」`);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'payment.remove', `撤销了「${mm.get(p.from_id)?.name} 转给 ${mm.get(p.to_id)?.name} ${fmtMoney(trip.base_currency, p.cents)}」`);
   });
   return { ok: true };
 });
@@ -623,12 +730,11 @@ route('GET', '/api/t/:key/log', async ({ params }) => {
 
 // ---------- 管理员 ----------
 route('GET', '/api/admin/trips', async () => {
-  const { rows: trips } = await db.query(`SELECT id, key, name, to_char(start_day,'YYYY-MM-DD') AS "startDay", to_char(end_day,'YYYY-MM-DD') AS "endDay",
-    locked, (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members,
+  const { rows: trips } = await db.query(`SELECT t.id, t.key, t.name, to_char(start_day,'YYYY-MM-DD') AS "startDay", to_char(end_day,'YYYY-MM-DD') AS "endDay",
+    locked, base_currency AS base, i.note AS "inviteNote", (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members,
     (SELECT count(*)::int FROM expenses WHERE trip_id=t.id) AS count,
     (SELECT COALESCE(sum(cents),0)::int FROM expenses WHERE trip_id=t.id) AS total
-    FROM trips t ORDER BY start_day DESC, id DESC`);
-  // 每次游玩还没结清的金额
+    FROM trips t LEFT JOIN invites i ON i.id=t.invite_id ORDER BY start_day DESC, t.id DESC`);
   // 每人净额 = 付出 - 应摊 + 已转出 - 已收到；未结清金额 = 所有正净额之和
   const { rows: flows } = await db.query(`
     SELECT trip_id, payer_id AS m, sum(cents)::int AS c FROM expenses GROUP BY 1,2
@@ -652,25 +758,81 @@ route('GET', '/api/admin/people', async () => {
   return { people: rows.map((r) => r.name) };
 }, { auth: 'admin' });
 
-route('POST', '/api/admin/trips', async ({ body }) => {
+// 新建游玩（管理员或凭邀请码）
+function parseNewTrip(body) {
   const name = cleanText(body.name, 40);
   if (!name) throw bad('请输入名称');
   if (!validDay(body.startDay)) throw bad('开始日期不对');
   const end = body.endDay || null;
   if (end && (!validDay(end) || end < body.startDay)) throw bad('结束日期不对');
+  const base = body.baseCurrency || 'CNY';
+  if (!CURRENCIES[base]) throw bad('结算币种不对');
   const names = [...new Set((Array.isArray(body.members) ? body.members : []).map((n) => cleanText(n, 20)).filter(Boolean))];
   if (names.length > 50) throw bad('最多 50 人');
+  return { name, start: body.startDay, end, base, names, note: cleanText(body.note, 500) };
+}
+async function createTrip(q, t, actor, inviteId = null) {
+  const key = newKey();
+  const { rows: [r] } = await q.query(`INSERT INTO trips(key,name,start_day,end_day,note,base_currency,invite_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [key, t.name, t.start, t.end, t.note, t.base, inviteId]);
+  for (const n of t.names) {
+    const pid = await findOrCreatePerson(q, n);
+    await q.query(`INSERT INTO members(trip_id,person_id) VALUES($1,$2)`, [r.id, pid]);
+  }
+  await log(q, r.id, actor, 'trip.create', `创建了「${t.name}」，结算币种${CURRENCIES[t.base].name}${t.names.length ? '，成员：' + t.names.join('、') : ''}`);
+  return { id: r.id, key };
+}
+route('POST', '/api/admin/trips', async ({ body }) => {
+  const t = parseNewTrip(body);
+  return tx((q) => createTrip(q, t, '管理员'));
+}, { auth: 'admin' });
+
+// 凭邀请码新建游玩（不需要登录）。错误次数限制和管理员登录共用一张表
+route('POST', '/api/invite/trips', async ({ body, req }) => {
+  const ipKey = `invite|${clientIp(req)}`;
+  const { rows: [fail] } = await db.query(`SELECT count FROM login_fails WHERE key=$1 AND first_at > now() - interval '15 minutes'`, [ipKey]);
+  if (fail && fail.count >= 8) throw new HttpError(429, '尝试次数太多，请 15 分钟后再试');
+  const code = cleanText(body.code, 40).toUpperCase().replace(/[\s-]/g, '');
+  const { rows: [inv] } = await db.query(`SELECT id, note FROM invites WHERE code=$1 AND NOT revoked`, [code]);
+  if (!inv) {
+    await db.query(`
+      INSERT INTO login_fails(key,count,first_at) VALUES($1,1,now())
+      ON CONFLICT (key) DO UPDATE SET
+        count = CASE WHEN login_fails.first_at > now() - interval '15 minutes' THEN login_fails.count+1 ELSE 1 END,
+        first_at = CASE WHEN login_fails.first_at > now() - interval '15 minutes' THEN login_fails.first_at ELSE now() END`, [ipKey]);
+    throw new HttpError(403, '邀请码不对或已停用');
+  }
+  const t = parseNewTrip(body);
+  const creator = cleanText(body.creator, 20);
+  if (creator && !t.names.includes(creator)) t.names.unshift(creator);
   return tx(async (q) => {
-    const key = newKey();
-    const { rows: [t] } = await q.query(`INSERT INTO trips(key,name,start_day,end_day,note) VALUES($1,$2,$3,$4,$5) RETURNING id`,
-      [key, name, body.startDay, end, cleanText(body.note, 500)]);
-    for (const n of names) {
-      const pid = await findOrCreatePerson(q, n);
-      await q.query(`INSERT INTO members(trip_id,person_id) VALUES($1,$2)`, [t.id, pid]);
-    }
-    await log(q, t.id, '管理员', 'trip.create', `创建了「${name}」${names.length ? '，成员：' + names.join('、') : ''}`);
-    return { id: t.id, key };
+    const r = await createTrip(q, t, creator || `邀请码（${inv.note || code}）`, inv.id);
+    await q.query(`UPDATE invites SET uses=uses+1 WHERE id=$1`, [inv.id]);
+    if (creator) r.meId = (await q.query(`SELECT m.id FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 AND p.name=$2`, [r.id, creator])).rows[0]?.id;
+    return r;
   });
+});
+
+// 邀请码管理
+const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉了容易看错的 0 O 1 I
+function newInviteCode() {
+  let s = '';
+  for (let i = 0; i < 10; i++) s += INVITE_ALPHABET[crypto.randomInt(INVITE_ALPHABET.length)];
+  return s;
+}
+route('GET', '/api/admin/invites', async () => {
+  const { rows } = await db.query(`SELECT id, code, note, uses, revoked, created_at AS "createdAt" FROM invites ORDER BY revoked, id DESC`);
+  return { invites: rows };
+}, { auth: 'admin' });
+route('POST', '/api/admin/invites', async ({ body }) => {
+  const note = cleanText(body.note, 30);
+  const { rows: [r] } = await db.query(`INSERT INTO invites(code,note) VALUES($1,$2) RETURNING id, code`, [newInviteCode(), note]);
+  return r;
+}, { auth: 'admin' });
+route('DELETE', '/api/admin/invites/:id', async ({ params }) => {
+  const { rowCount } = await db.query(`UPDATE invites SET revoked=true WHERE id=$1`, [params.id]);
+  if (!rowCount) throw new HttpError(404, '邀请码不存在');
+  return { ok: true };
 }, { auth: 'admin' });
 
 route('POST', '/api/admin/trips/:id/rekey', async ({ params }) => {
@@ -695,30 +857,51 @@ route('DELETE', '/api/admin/trips/:id', async ({ params }) => {
   return { ok: true };
 }, { auth: 'admin' });
 
-// 跨游玩统计（按年）
+// 跨游玩统计（按年）。各次游玩的结算币种可能不同，统一折算成人民币
 route('GET', '/api/admin/stats', async ({ query }) => {
   const year = Number(query.get('year')) || Number(todayStr().slice(0, 4));
   if (year < 2000 || year > 2100) throw bad('年份不对');
   const from = `${year}-01-01`, to = `${year + 1}-01-01`;
-  const [{ rows: trips }, { rows: people }, { rows: cats }, { rows: months }, { rows: years }] = await Promise.all([
-    db.query(`SELECT t.id, t.name, to_char(t.start_day,'YYYY-MM-DD') AS "startDay", COALESCE(sum(e.cents),0)::int AS total,
-      (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members
-      FROM trips t LEFT JOIN expenses e ON e.trip_id=t.id WHERE t.start_day >= $1 AND t.start_day < $2 GROUP BY t.id ORDER BY t.start_day`, [from, to]),
-    db.query(`SELECT p.name,
-        count(DISTINCT m.trip_id)::int AS trips,
-        COALESCE((SELECT sum(e.cents) FROM expenses e JOIN members m2 ON m2.id=e.payer_id JOIN trips t2 ON t2.id=e.trip_id
-                  WHERE m2.person_id=p.id AND t2.start_day >= $1 AND t2.start_day < $2),0)::int AS paid,
-        COALESCE((SELECT sum(s.cents) FROM expense_shares s JOIN members m3 ON m3.id=s.member_id JOIN trips t3 ON t3.id=m3.trip_id
-                  WHERE m3.person_id=p.id AND t3.start_day >= $1 AND t3.start_day < $2),0)::int AS share
-      FROM people p JOIN members m ON m.person_id=p.id JOIN trips t ON t.id=m.trip_id
-      WHERE t.start_day >= $1 AND t.start_day < $2 GROUP BY p.id ORDER BY share DESC`, [from, to]),
-    db.query(`SELECT e.category, sum(e.cents)::int AS cents FROM expenses e JOIN trips t ON t.id=e.trip_id
-      WHERE t.start_day >= $1 AND t.start_day < $2 GROUP BY 1 ORDER BY 2 DESC`, [from, to]),
-    db.query(`SELECT extract(month FROM t.start_day)::int AS m, COALESCE(sum(e.cents),0)::int AS cents, count(DISTINCT t.id)::int AS trips
-      FROM trips t LEFT JOIN expenses e ON e.trip_id=t.id WHERE t.start_day >= $1 AND t.start_day < $2 GROUP BY 1 ORDER BY 1`, [from, to]),
+  const [{ rows: trips }, { rows: exps }, { rows: shares }, { rows: mems }, { rows: rates }, { rows: years }] = await Promise.all([
+    db.query(`SELECT id, name, to_char(start_day,'YYYY-MM-DD') AS "startDay", base_currency AS base,
+      (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members FROM trips t WHERE start_day >= $1 AND start_day < $2 ORDER BY start_day`, [from, to]),
+    db.query(`SELECT e.trip_id, e.category, e.cents, m.person_id FROM expenses e JOIN trips t ON t.id=e.trip_id JOIN members m ON m.id=e.payer_id
+      WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+    db.query(`SELECT e.trip_id, s.cents, m.person_id FROM expense_shares s JOIN expenses e ON e.id=s.expense_id JOIN trips t ON t.id=e.trip_id
+      JOIN members m ON m.id=s.member_id WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+    db.query(`SELECT m.trip_id, p.id AS person_id, p.name FROM members m JOIN people p ON p.id=m.person_id JOIN trips t ON t.id=m.trip_id
+      WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+    db.query(`SELECT trip_id, currency, rate::float AS rate FROM trip_rates`),
     db.query(`SELECT DISTINCT extract(year FROM start_day)::int AS y FROM trips ORDER BY 1 DESC`),
   ]);
-  return { year, years: years.map((r) => r.y), trips, people, categories: cats, months, categoryNames: CATEGORIES };
+  const live = await liveRates();
+  const factor = new Map(trips.map((t) => [t.id, toCnyFactor(t.base, rates.filter((r) => r.trip_id === t.id), live)]));
+  const cny = (tripId, c) => Math.round(c * (factor.get(tripId) ?? 1));
+  const tripTotal = new Map();
+  for (const e of exps) tripTotal.set(e.trip_id, (tripTotal.get(e.trip_id) || 0) + cny(e.trip_id, e.cents));
+  const people = new Map();
+  for (const m of mems) {
+    if (!people.has(m.person_id)) people.set(m.person_id, { name: m.name, trips: 0, paid: 0, share: 0 });
+    people.get(m.person_id).trips++;
+  }
+  for (const e of exps) if (people.has(e.person_id)) people.get(e.person_id).paid += cny(e.trip_id, e.cents);
+  for (const s of shares) if (people.has(s.person_id)) people.get(s.person_id).share += cny(s.trip_id, s.cents);
+  const cats = new Map();
+  for (const e of exps) cats.set(e.category, (cats.get(e.category) || 0) + cny(e.trip_id, e.cents));
+  const months = new Map();
+  for (const t of trips) {
+    const m = Number(t.startDay.slice(5, 7));
+    const x = months.get(m) || { m, cents: 0, trips: 0 };
+    x.cents += tripTotal.get(t.id) || 0; x.trips++; months.set(m, x);
+  }
+  return {
+    year, years: years.map((r) => r.y),
+    trips: trips.map((t) => ({ id: t.id, name: t.name, startDay: t.startDay, members: t.members, base: t.base, total: tripTotal.get(t.id) || 0 })),
+    people: [...people.values()].sort((a, b) => b.share - a.share),
+    categories: [...cats].map(([category, cents]) => ({ category, cents })).sort((a, b) => b.cents - a.cents),
+    months: [...months.values()].sort((a, b) => a.m - b.m),
+    categoryNames: CATEGORIES,
+  };
 }, { auth: 'admin' });
 
 // ---------- 静态文件 ----------
@@ -782,6 +965,12 @@ const server = http.createServer(async (req, res) => {
     if (admin?.renewToken) res.setHeader('Set-Cookie', sessionCookie(admin.renewToken, SESSION_DAYS * 86400));
     if (r.auth === 'admin' && !admin) throw new HttpError(401, '请先登录');
     const result = await r.handler({ req, res, admin, params, body, rawBody, query: url.searchParams });
+    if (result && result.__file) {
+      const f = result.__file;
+      res.writeHead(200, { 'Content-Type': f.type, 'Content-Length': f.data.length, 'Cache-Control': 'no-store',
+        'Content-Disposition': `attachment; filename="export.xlsx"; filename*=UTF-8''${encodeURIComponent(f.name)}` });
+      return res.end(f.data);
+    }
     if (result && result.__image) {
       const { file, mime } = result.__image;
       const data = await fs.promises.readFile(path.join(UPLOADS, file)).catch(() => null);

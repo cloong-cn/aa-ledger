@@ -7,7 +7,13 @@
 
   // 一笔钱怎么分：parts = [{memberId, weight, fixed}]，fixed 不为 null 表示指定金额。
   // 先扣掉指定金额，剩下的按份数分；除不尽的几分钱按"最大余数"逐个补给排在前面的人，保证加起来正好等于总额。
-  function computeShares(cents, parts) {
+  // unit：最小单位（分）。日元没有小数，unit=100，分出来的每一份都是整数円
+  function computeShares(cents, parts, unit) {
+    unit = unit || 1;
+    if (unit > 1) {
+      const scaled = computeShares(cents / unit, parts.map((p) => ({ ...p, fixed: p.fixed != null ? p.fixed / unit : null })), 1);
+      return scaled.map((x) => ({ ...x, fixed: x.fixed != null ? x.fixed * unit : null, cents: x.cents * unit }));
+    }
     const fixedSum = parts.reduce((a, p) => a + (p.fixed != null ? p.fixed : 0), 0);
     if (fixedSum > cents) throw shareError('指定金额加起来超过了总额');
     const rest = cents - fixedSum;
@@ -31,7 +37,8 @@
     }));
   }
   // 按比例把 total 分成若干份（amounts 是各自的原币金额），用 BigInt 防溢出，零头按最大余数补，保证加起来正好等于 total
-  function distribute(total, amounts) {
+  function distribute(total, amounts, unit) {
+    if (unit > 1) return distribute(total / unit, amounts, 1).map((x) => x * unit);
     const A = amounts.reduce((a, b) => a + b, 0);
     if (A === 0) { const out = amounts.map(() => 0); if (out.length) out[0] = total; return out; }
     const T = BigInt(total), BA = BigInt(A);
@@ -44,9 +51,10 @@
 
   // 外币账：先按原币分摊（origCents 总额），再把人民币总额 cnyCents 按各人原币份额折算。
   // 返回 [{memberId, weight, fixed, origCents, cents}]，fixed 是原币指定金额
-  function splitExpense(origCents, cnyCents, parts) {
-    const orig = computeShares(origCents, parts);
-    const cny = distribute(cnyCents, orig.map((s) => s.cents));
+  // origUnit / baseUnit：原币和结算币种的最小单位（日元 100，其余 1）
+  function splitExpense(origCents, cnyCents, parts, origUnit, baseUnit) {
+    const orig = computeShares(origCents, parts, origUnit);
+    const cny = distribute(cnyCents, orig.map((s) => s.cents), baseUnit);
     return orig.map((s, i) => ({ memberId: s.memberId, weight: s.weight, fixed: s.fixed, origCents: s.cents, cents: cny[i] }));
   }
 
@@ -81,5 +89,11 @@
     return { balances, transfers };
   }
 
-  return { computeShares, distribute, splitExpense, settle };
+  // 各币种的最小单位（以"分"计）：日元没有小数
+  const UNITS = { JPY: 100 };
+  const unitOf = (cur) => UNITS[cur] || 1;
+  // 按最小单位取整
+  const roundTo = (cents, unit) => Math.round(cents / unit) * unit;
+
+  return { computeShares, distribute, splitExpense, settle, unitOf, roundTo };
 });
