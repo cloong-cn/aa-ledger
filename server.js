@@ -604,7 +604,7 @@ route('GET', '/api/t/:key/export', async ({ params, admin }) => {
   const d = await tripPayload(trip, admin);
   const base = trip.base_currency, B = CURRENCIES[base].name;
   const name = new Map(d.members.map((m) => [m.id, m.name]));
-  const Y = (c) => Math.round(c) / 100;
+  const Y = (c) => Math.round(c * 10) / 1000; // 应摊可能带半分（精确值），保留到 0.001
   const exps = d.expenses.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.id - b.id));
   const sheets = [];
   sheets.push({
@@ -619,10 +619,10 @@ route('GET', '/api/t/:key/export', async ({ params, admin }) => {
       ...d.members.map((m) => { const sh = e.shares.find((x) => x.memberId === m.id); return sh ? Y(sh.cents) : null; }),
       e.note, e.createdBy]),
     totalRow: ['合计', '', '', '', '', null, '', Y(exps.reduce((a, e) => a + e.cents, 0)),
-      // 每人合计用结算结果（按精确值合计再四舍五入），可能跟上面逐笔加起来差 1 分
+      // 每人合计用精确应摊（除不尽时带三位小数），可能跟上面逐笔加起来差不到 1 分
       ...d.members.map((m) => Y(d.balances.find((b) => b.memberId === m.id)?.share || 0)),
       d.members.some((m) => (d.balances.find((b) => b.memberId === m.id)?.share || 0) !== exps.reduce((a, e) => a + (e.shares.find((x) => x.memberId === m.id)?.cents || 0), 0))
-        ? '每人合计按精确金额相加后四舍五入，跟逐笔相加可能差 1 分' : '', ''],
+        ? '每人合计是精确金额（逐笔的零头先记给了某个人，所以逐笔相加可能差 1 分）' : '', ''],
   });
   sheets.push({
     name: '每人汇总',

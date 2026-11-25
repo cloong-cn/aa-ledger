@@ -108,7 +108,8 @@
       const neg = n < 0n, a = neg ? -n : n;
       const q = (2n * a + d * U) / (2n * d * U);                       // 绝对值四舍五入到 unit
       const r = Number(neg ? -q * U : q * U);
-      return { x, r, en: BigInt(r) * d - n, ed: d };                  // 取整多算了 en/ed 分（用于极少数的差额修正）
+      const tie = (2n * n) % (d * U) === 0n && n % (d * U) !== 0n;     // 精确值正好是半分（例如 8.225），四舍五入时最容易被问
+      return { x, r, tie, ex: Number((n * 1000000n) / d) / 1000000, en: BigInt(r) * d - n, ed: d }; // 取整多算了 en/ed 分（用于极少数的差额修正）
     });
     let sum = rounded.reduce((a, y) => a + y.r, 0);
     if (sum) {
@@ -117,7 +118,12 @@
       const order = rounded.slice().sort((p, q) => (sum > 0 ? cmp(q, p) : cmp(p, q)) || p.x.memberId - q.x.memberId);
       for (let k = 0; sum; k = (k + 1) % order.length) { const s = sum > 0 ? -unit : unit; order[k].r += s; sum += s; }
     }
-    for (const { x, r } of rounded) { x.share = x.paid - r; x.net = r + x.sent - x.received; }
+    // 显示用的应摊：一般 = 垫付 − 取整后的结果（所以表格里「垫付 − 应摊 = 结果」永远对得上）；
+    // 只有精确值正好是半分时，显示精确应摊（例如 250.225），让人看得出结果为什么进了一分
+    for (const { x, r, tie, ex } of rounded) {
+      x.share = tie ? x.paid - ex : x.paid - r;
+      x.net = r + x.sent - x.received;
+    }
 
     const debtors = balances.filter((x) => x.net < 0).map((x) => ({ id: x.memberId, amt: -x.net }));
     const creditors = balances.filter((x) => x.net > 0).map((x) => ({ id: x.memberId, amt: x.net }));

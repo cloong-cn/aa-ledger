@@ -125,7 +125,7 @@ eq('日元结算零头', splitExpense(1000, 47800, [1, 2, 3].map((id) => ({ memb
   const bj = [mk(130, 10200, [129, 130]), mk(130, 7000, [129]), mk(129, 19250, [129, 130]), mk(129, 3195, [129, 130]), mk(129, 3400, [129, 130])];
   let r = settle([129, 130], bj, []);
   eq('北京：转账 8.23', r.transfers, [{ fromId: 130, toId: 129, cents: 823 }]);
-  eq('北京：应摊', r.balances.map((b) => [b.paid, b.share]), [[25845, 25022], [17200, 18023]]);
+  eq('北京：应摊', r.balances.map((b) => [b.paid, b.share]), [[25845, 25022.5], [17200, 18022.5]]);
   r = settle([129, 130], bj, [{ fromId: 130, toId: 129, cents: 823 }]);
   eq('北京：转完结清', [r.transfers.length, r.balances.map((b) => b.net)], [0, [0, 0]]);
   // 三人分 100，A 付：精确 +66.667 / -33.333 / -33.333 → 四舍五入后差 1 分，修正后仍然加起来是 0
@@ -167,6 +167,8 @@ eq('日元结算零头', splitExpense(1000, 47800, [1, 2, 3].map((id) => ({ memb
       if (n === 2 ? b.net !== half : Math.abs(b.net - v) >= 1) { bad2++; console.log('✗ 四舍五入', n, b, v, JSON.stringify(exps)); break; }
     }
     if (sum !== 0 || transfers.length > n - 1) { bad2++; console.log('✗ 四舍五入后不平', sum); }
+    // 显示的应摊：不是半分时一定是整分，且 垫付 − 应摊 = 结果
+    for (const b of balances) if (Number.isInteger(b.share) ? b.paid - b.share !== b.net : (b.share * 2) % 1 !== 0) { bad2++; console.log('✗ 应摊显示', b); break; }
     const after = settle(ids, exps, transfers);
     if (after.transfers.length) { bad2++; console.log('✗ 转完没清零'); }
   }

@@ -68,10 +68,15 @@ const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// c 一般是整数分；精确应摊可能带小数分（例如 25022.5 → 250.225），这时显示三位小数，除不尽的再加「≈」
 function money(c, { sign = false, cur = true } = {}) {
-  const neg = c < 0; const a = Math.abs(c);
-  const s = (a / 100).toFixed(a % 100 === 0 ? 0 : 2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? CUR[BASE].sym : '') + s;
+  const neg = c < 0; let a = Math.abs(c), approx = '';
+  if (Math.abs(a - Math.round(a)) < 1e-6) a = Math.round(a);
+  let s;
+  if (Number.isInteger(a)) s = (a / 100).toFixed(a % 100 === 0 ? 0 : 2);
+  else { const t = Math.round(a * 10); if (Math.abs(a * 10 - t) > 1e-6) approx = '≈'; s = (t / 1000).toFixed(3); }
+  s = s.replace(/^(\d+)/, (x) => x.replace(/\B(?=(\d{3})+(?!\d))/g, ','));
+  return approx + (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? CUR[BASE].sym : '') + s;
 }
 // 指定币种的金额（带该币种符号）
 const curMoney = (cur, c) => (c < 0 ? '-' : '') + CUR[cur || BASE].sym + money(Math.abs(c), { cur: false });
@@ -202,7 +207,7 @@ async function route() {
     S.admin = meRes.admin; S.today = meRes.today;
   } catch (e) { $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">📡</div>${esc(e.message)}</div></div>`; return; }
   if (m) {
-    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; }
+    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; S.billFilter = 'all'; }
     return loadTrip(true);
   }
   S.trip = null; S.key = null;
@@ -499,6 +504,12 @@ async function act(fn, okMsg) {
   catch (e) { toast(e.message, true); if (e.status === 423 || e.status === 404) await refresh(); throw e; }
 }
 
+// 其他页的一行摘要：我还要付 / 还应收回
+function heroMine(me) {
+  if (!me) return `<span>${T().transfers.length ? `待转账 <b class="num">${T().transfers.length}</b> 笔` : '已全部结清'}</span>`;
+  const b = balOf(me.id);
+  return `<span>${b.net > 0 ? `我还应收回 <b class="num">${money(b.net)}</b>` : b.net < 0 ? `我还要付 <b class="num">${money(-b.net)}</b>` : '我已结清'}</span>`;
+}
 function renderTrip() {
   const d = T(), t = d.trip;
   document.title = `${t.name} · AA 账本`;
@@ -519,17 +530,17 @@ function renderTrip() {
       <h1>${esc(t.name)}</h1>
       <button class="chip-me" id="whoami">${me ? `我是 <b>${esc(me.name)}</b>` : '我是谁？'} ▾</button>
     </div>
-    <div class="hero">
+    ${S.tab === 'bills' ? `<div class="hero">
       <div class="label">一共花了</div>
       <div class="big num">${money(total)}</div>
       <div class="meta">${range(t)} · ${d.members.length} 人${t.base !== 'CNY' ? ` · ${BN()}结算${t.toCny ? `，约合人民币 ${curMoney('CNY', Math.round(total * t.toCny))}` : ''}` : ''}</div>
       <div class="row">${mine}</div>
-    </div>
+    </div>` : `<div class="hero mini"><span>共 <b class="num">${money(total)}</b></span>${heroMine(me)}</div>`}
     ${t.locked ? `<div class="banner lock">🔒<span class="sp">账单已锁定${t.lockedAt ? '（' + fmtTime(t.lockedAt) + '）' : ''}，只能查看${S.admin ? '' : '。需要改的话请找管理员解锁'}</span></div>` : ''}
     <div id="tab-body"></div>
   </div>
-  ${editable() && S.tab === 'bills' ? '<button class="fab" id="fab">＋ 记一笔</button>' : ''}
-  <nav class="tabbar"><div class="in">${tabs.map(([k, i, n]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}"><span class="i">${i}</span>${n}</button>`).join('')}</div></nav>`;
+  <nav class="tabbar"><div class="in">${tabs.map(([k, i, n], j) => (j === 2 && editable() ? '<button class="tab-add" id="fab" aria-label="记一笔"><span>＋</span>记一笔</button>' : '')
+    + `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}"><span class="i">${i}</span>${n}</button>`).join('')}</div></nav>`;
   document.getElementById('whoami').onclick = whoAmISheet;
   const fab = document.getElementById('fab');
   if (fab) fab.onclick = () => expenseForm(null);
@@ -570,12 +581,24 @@ function whoAmISheet() {
 function renderBills(body) {
   const d = T();
   if (!d.expenses.length) {
-    body.innerHTML = `<div class="empty"><div class="e">🧾</div>还没有账目<br><span class="small">谁付了钱，就点右下角「记一笔」</span></div>`;
+    body.innerHTML = `<div class="empty"><div class="e">🧾</div>还没有账目<br><span class="small">谁付了钱，就点下面的「＋ 记一笔」</span></div>`;
     return;
   }
+  // 账多了（≥6 笔）才显示筛选：全部 / 我付的 / 我参与的 / 各大类（只列出用到的）
+  let html = '', list = d.expenses;
+  if (d.expenses.length >= 6) {
+    const opts = [['all', '全部']];
+    if (S.me) opts.push(['paid', '我付的'], ['mine', '我参与的']);
+    for (const g of GROUPS) if (d.expenses.some((e) => groupOf(e.category) === g.key)) opts.push([g.key, `${g.icon} ${g.name}`]);
+    if (!opts.some(([k]) => k === S.billFilter)) S.billFilter = 'all';
+    const fl = S.billFilter || 'all';
+    list = fl === 'all' ? list : fl === 'paid' ? list.filter((e) => e.payerId === S.me)
+      : fl === 'mine' ? list.filter((e) => e.shares.some((s) => s.memberId === S.me)) : list.filter((e) => groupOf(e.category) === fl);
+    html += `<div class="filter-row">${opts.map(([k, n]) => `<button class="chip small-chip ${fl === k ? 'on' : ''}" data-f="${k}">${n}</button>`).join('')}</div>`;
+    if (fl !== 'all') html += `<p class="muted small" style="margin:0 4px 8px">${list.length} 笔，共 <b class="num">${money(list.reduce((a, e) => a + e.cents, 0))}</b>${fl === 'mine' ? `，我的部分 <b class="num">${money(list.reduce((a, e) => a + (e.shares.find((s) => s.memberId === S.me)?.cents || 0), 0))}</b>` : ''}</p>`;
+  }
   const groups = new Map();
-  for (const e of d.expenses) { if (!groups.has(e.day)) groups.set(e.day, []); groups.get(e.day).push(e); }
-  let html = '';
+  for (const e of list) { if (!groups.has(e.day)) groups.set(e.day, []); groups.get(e.day).push(e); }
   for (const [day, list] of groups) {
     const sum = list.reduce((a, e) => a + e.cents, 0);
     html += `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
@@ -590,6 +613,7 @@ function renderBills(body) {
   }
   body.innerHTML = html;
   body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
+  body.querySelectorAll('[data-f]').forEach((b) => b.onclick = () => { S.billFilter = b.dataset.f; renderBills(body); });
 }
 
 // 除不尽时说明精确金额：单笔里零头先记给一个人（这样这笔加起来正好等于总额），结算时按精确值合计、最后四舍五入
@@ -676,7 +700,11 @@ function expenseForm(exp) {
     const $ = (s) => el.querySelector(s);
     const tripRate = () => (f.currency === BASE ? 1 : d.rates[f.currency]?.rate);
     const drawCur = () => {
-      $('#f-cur').innerHTML = CURS.map((c) => `<button type="button" class="chip small-chip ${f.currency === c.key ? 'on' : ''}" data-cur="${c.key}">${c.short}</button>`).join('');
+      // 平时只显示结算币种 + 这次游玩用过的币种，其他的收在「更多币种」里
+      const used = new Set([BASE, f.currency, ...d.expenses.map((x) => x.currency)]);
+      const list = f.allCur ? CURS : CURS.filter((c) => used.has(c.key));
+      $('#f-cur').innerHTML = list.map((c) => `<button type="button" class="chip small-chip ${f.currency === c.key ? 'on' : ''}" data-cur="${c.key}">${c.short}</button>`).join('')
+        + (list.length < CURS.length ? '<button type="button" class="chip small-chip more-chip" data-more="1">更多币种 ▾</button>' : '');
       $('#f-sym').textContent = CUR[f.currency].sym;
       $('#f-amount').style.paddingLeft = (CUR[f.currency].sym.length * 15 + 12) + 'px';
       const box = $('#f-fx');
@@ -780,7 +808,10 @@ function expenseForm(exp) {
         + (n < 9 ? '<button type="button" class="thumb add" id="f-addimg" aria-label="添加图片">＋</button>' : '');
     };
     drawCats(); drawPayer(); drawWho(); drawImgs(); drawCur();
-    $('#f-cur').onclick = (e) => { const b = e.target.closest('[data-cur]'); if (b) { f.currency = b.dataset.cur; drawCur(); } };
+    $('#f-cur').onclick = (e) => {
+      if (e.target.closest('[data-more]')) { f.allCur = true; return drawCur(); }
+      const b = e.target.closest('[data-cur]'); if (b) { f.currency = b.dataset.cur; drawCur(); }
+    };
 
     $('#f-amount').oninput = preview;
     $('#f-cat').onclick = (e) => {
@@ -891,7 +922,7 @@ function renderSettle(body) {
         const hasCode = to && (to.codes.wechat || to.codes.alipay);
         const mine = S.me && (x.fromId === S.me || x.toId === S.me);
         return `<div class="xfer ${mine ? 'me' : ''}"><div class="who" data-remind="${i}" role="button" tabindex="0" title="复制提醒文字"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
-          <div class="acts"><button class="btn small" data-remind="${i}" aria-label="复制提醒">📋</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
+          <div class="acts"><button class="btn small" data-remind="${i}">催款</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
       }).join('')}
       <div style="padding:10px 16px 12px"><button class="btn block" id="remind-all">📋 复制催款消息（发到群里）</button></div></div>`;
   } else {
@@ -905,7 +936,7 @@ function renderSettle(body) {
       const state = b.net > 0 ? `<span class="pos">应收 ${money(b.net)}</span>` : b.net < 0 ? `<span class="neg">应付 ${money(-b.net)}</span>` : diff !== 0 ? '<span class="muted">已结清</span>' : '<span class="muted">—</span>';
       return `<tr><td>${esc(nameOf(b.memberId))}${b.memberId === S.me ? ' <span class="tag ink">我</span>' : ''}</td><td>${money(b.paid)}</td><td>${money(b.share)}</td><td>${state}</td></tr>`;
     }).join('')}</tbody></table>
-    <p class="faint tiny" style="margin:10px 0 0">垫付 = 替大家付的钱；应摊 = 自己该承担的部分；结果已扣除下面「已转账」的金额</p></div>`;
+    <p class="faint tiny" style="margin:10px 0 0">垫付 = 替大家付的钱；应摊 = 自己该承担的部分；结果 = 垫付 − 应摊，再扣除「已转账」的金额${d.balances.some((b) => !Number.isInteger(b.share)) ? '。<br>有的账除不尽（比如 31.95 两人分，每人 15.975），应摊显示的是精确值，结果四舍五入到分' : ''}</p></div>`;
   if (d.payments.length) {
     html += `<div class="card"><h2>已转账</h2>${d.payments.slice().reverse().map((p) => `<div class="kv"><span>✓ ${esc(nameOf(p.fromId))} → ${esc(nameOf(p.toId))} <span class="faint tiny">${fmtTime(p.createdAt)}</span></span>
       <span class="num">${money(p.cents)}${editable() ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
@@ -1136,11 +1167,10 @@ function renderStats(body) {
   const first = days[0], last = days[days.length - 1];
   const span = daysBetween(first, last) + 1;
   const sharers = d.balances.filter((b) => b.share > 0).length || 1;
-  let html = `<div class="tiles">
-    <div class="tile"><div class="l">总花费</div><div class="v num">${money(total)}</div></div>
+  let html = `<div class="tiles tiles-3">
     <div class="tile"><div class="l">人均</div><div class="v num">${money(Math.round(total / sharers))}</div></div>
-    <div class="tile"><div class="l">笔数</div><div class="v num">${d.expenses.length}<small> 笔</small></div></div>
-    <div class="tile"><div class="l">${span > 1 ? `${span} 天，日均` : '天数'}</div><div class="v num">${span > 1 ? money(Math.round(total / span)) : '1<small> 天</small>'}</div></div></div>`;
+    <div class="tile"><div class="l">${span > 1 ? `${span} 天·日均` : '天数'}</div><div class="v num">${span > 1 ? money(Math.round(total / span)) : '1<small> 天</small>'}</div></div>
+    <div class="tile"><div class="l">笔数</div><div class="v num">${d.expenses.length}<small> 笔</small></div></div></div>`;
 
   // 每人：垫付 vs 应摊
   const rows = d.balances.filter((b) => member(b.memberId)).sort((a, b) => b.share - a.share);
