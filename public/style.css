@@ -304,3 +304,8 @@ details > summary::-webkit-details-marker { display: none; }
 details > summary::before { content: "▸ "; }
 details[open] > summary::before { content: "▾ "; }
 .tag { white-space: nowrap; }
+
+/* 管理员首页的数据安全状态行 */
+.health { display: block; width: 100%; text-align: left; margin: 0 0 12px; padding: 9px 12px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--card); color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; }
+.health.bad { color: var(--danger); border-color: var(--danger); }

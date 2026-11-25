@@ -52,10 +52,13 @@
   // 外币账：先按原币分摊（origCents 总额），再把人民币总额 cnyCents 按各人原币份额折算。
   // 返回 [{memberId, weight, fixed, origCents, cents}]，fixed 是原币指定金额
   // origUnit / baseUnit：原币和结算币种的最小单位（日元 100，其余 1）
+  // 先按 memberId 排好序再算：零头补给谁只取决于成员，跟录入顺序无关，所以任何时候按存下来的份数重算都得到同样结果（数据校验靠这个）
   function splitExpense(origCents, cnyCents, parts, origUnit, baseUnit) {
-    const orig = computeShares(origCents, parts, origUnit);
+    const sorted = parts.slice().sort((a, b) => a.memberId - b.memberId);
+    const orig = computeShares(origCents, sorted, origUnit);
     const cny = distribute(cnyCents, orig.map((s) => s.cents), baseUnit);
-    return orig.map((s, i) => ({ memberId: s.memberId, weight: s.weight, fixed: s.fixed, origCents: s.cents, cents: cny[i] }));
+    const byId = new Map(orig.map((s, i) => [s.memberId, { memberId: s.memberId, weight: s.weight, fixed: s.fixed, origCents: s.cents, cents: cny[i] }]));
+    return parts.map((p) => byId.get(p.memberId));
   }
 
   function shareError(msg) { const e = new Error(msg); e.status = 400; return e; }

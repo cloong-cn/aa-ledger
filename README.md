@@ -1,5 +1,7 @@
 # AA 账本
 
+> 维护、部署、备份恢复、排障：见 **[docs/MAINTENANCE.md](docs/MAINTENANCE.md)**
+
 出去玩 AA 分账的小程序。Node.js（仅依赖 `pg`）+ PostgreSQL，前端无框架。
 
 - 管理员登录后创建「一次游玩」，把分享链接（`/t/<密钥>`）发到群里；朋友打开链接、选「我是谁」就能记账，不用注册。
@@ -16,6 +18,8 @@
 - 结算页可复制催款消息（群发汇总 / 单独提醒）；可导出 Excel（`/api/t/<key>/export`，xlsx.js 无依赖生成）。
 - 管理员年度统计把不同结算币种折算成人民币汇总。
 
+- 数据安全：数据库触发器拒绝不平的账；同一次游玩的修改排队执行；删除先进回收站（30 天可恢复）；每日备份（自校验）+ 全量数据校验（`node server.js check`，管理员首页顶部显示）。
+
 ## 目录
 - `server.js` 接口与静态文件；`schema.sql` 启动时自动执行（幂等）
 - `public/` 前端；`deploy/` systemd 与 nginx 配置样本；`tests/` 测试
@@ -23,4 +27,6 @@
 ## 命令
     node server.js create-admin <用户名> [密码]   # 建管理员 / 重置密码
     node server.js clean-uploads                  # 删除没被引用的图片文件
-    sh tests/run.sh                               # 算法 + 接口测试（用 zz* 临时数据，跑完清理）
+    node server.js check                          # 全量数据校验
+    sh tests/run.sh                               # 算法 + 接口测试 + 数据校验（用 zz* 临时数据，跑完清理）
+    sudo -u aa sh deploy/backup.sh                # 立即备份

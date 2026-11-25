@@ -222,7 +222,9 @@ async function renderAdmin() {
       <button class="btn primary small" id="new-trip">＋ 新建游玩</button>
       <button class="icon-btn" id="admin-menu" aria-label="菜单">⋯</button></div>
     <div class="seg"><button data-at="trips" class="${S.adminTab === 'trips' ? 'on' : ''}">游玩</button><button data-at="stats" class="${S.adminTab === 'stats' ? 'on' : ''}">年度统计</button></div>
+    <button class="health" id="health" hidden></button>
     <div id="admin-body"><div class="empty">加载中…</div></div></div>`;
+  loadHealth();
   $app.querySelectorAll('[data-at]').forEach((b) => b.onclick = () => { S.adminTab = b.dataset.at; renderAdmin(); });
   document.getElementById('new-trip').onclick = () => newTripSheet(false);
   document.getElementById('admin-menu').onclick = adminMenu;
@@ -283,10 +285,14 @@ function adminMenu() {
   openSheet(`${sheetHead('管理员')}
     <div class="list">
       <button class="item" id="am-inv"><span class="cat">🎟️</span><span class="main"><span class="t">邀请码</span><span class="s">发给朋友，他们就能自己新建游玩</span></span></button>
+      <button class="item" id="am-safe"><span class="cat">🛡️</span><span class="main"><span class="t">数据安全</span><span class="s">数据校验、备份情况、下载备份</span></span></button>
+      <button class="item" id="am-trash"><span class="cat">🗑️</span><span class="main"><span class="t">回收站</span><span class="s">删除的游玩保留 30 天，可以恢复</span></span></button>
       <button class="item" id="am-pw"><span class="cat">🔑</span><span class="main"><span class="t">修改密码</span></span></button>
       <button class="item" id="am-out"><span class="cat">↩︎</span><span class="main"><span class="t">退出登录</span><span class="s">${esc(S.admin.username)}</span></span></button>
     </div>`, (el) => {
     el.querySelector('#am-inv').onclick = invitesSheet;
+    el.querySelector('#am-safe').onclick = () => healthSheet();
+    el.querySelector('#am-trash').onclick = tripTrashSheet;
     el.querySelector('#am-out').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); closeSheet(); route(); };
     el.querySelector('#am-pw').onclick = () => openSheet(`${sheetHead('修改密码')}
       <form id="pwf"><div class="field"><label>原密码</label><input class="input" type="password" name="old" autocomplete="current-password" required></div>
@@ -297,6 +303,48 @@ function adminMenu() {
         try { await api('POST', '/api/password', { old: f.get('old'), new: f.get('new') }); closeSheet(); toast('密码已修改'); }
         catch (err) { el2.querySelector('.err').textContent = err.message; }
       };
+    });
+  });
+}
+
+// 数据安全：管理员首页顶部一行状态；有问题时变红
+let HEALTH = null;
+const ago = (h) => h < 1 ? '不到 1 小时前' : h < 48 ? `${Math.round(h)} 小时前` : `${Math.round(h / 24)} 天前`;
+async function loadHealth() {
+  const el = document.getElementById('health');
+  try { HEALTH = await api('GET', '/api/admin/health'); } catch { return; }
+  if (!el || !el.isConnected) return;
+  const { check, backup } = HEALTH;
+  const backupOk = backup && backup.ageHours < 30;
+  el.hidden = false;
+  el.className = 'health' + (check.ok && backupOk ? '' : ' bad');
+  el.innerHTML = `${check.ok ? '✅ 账目校验通过' : `⚠️ 校验发现 ${check.problems.length} 个问题`} · ${backup ? `${backupOk ? '' : '⚠️ '}最近备份 ${ago(backup.ageHours)}` : '⚠️ 还没有备份'}<span class="faint"> ›</span>`;
+  el.onclick = () => healthSheet();
+}
+async function healthSheet() {
+  try { HEALTH = await api('GET', '/api/admin/health'); } catch (e) { return toast(e.message, true); }
+  const { check, backup } = HEALTH, c = check.counts;
+  openSheet(`${sheetHead('数据安全')}
+    <div class="card"><b>${check.ok ? '✅ 账目校验全部正确' : `⚠️ 发现 ${check.problems.length} 个问题`}</b>
+      <p class="muted small" style="margin:6px 0 0">把 ${c.trips} 次游玩、${c.expenses} 笔账、${c.payments} 笔转账按存下的份数和汇率重新算了一遍，逐分比对；并检查每次游玩收支平衡、${c.files} 个图片文件都在。</p>
+      ${check.problems.length ? `<ul class="small neg" style="padding-left:18px">${check.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul><p class="small muted">请截图发给维护的人（处理方法见 docs/MAINTENANCE.md「数据校验报错」）。</p>` : ''}</div>
+    <div class="card"><b>${backup ? `${backup.ageHours < 30 ? '✅' : '⚠️'} 最近备份：${fmtTime(backup.at)}（${ago(backup.ageHours)}）` : '⚠️ 还没有备份'}</b>
+      <p class="muted small" style="margin:6px 0 0">服务器每天自动备份数据库（保留 60 天）、截图和代码。备份在同一台服务器上，建议隔一段时间下载一份存到自己电脑或网盘，万一服务器整个坏了也能恢复。</p>
+      ${backup ? `<a class="btn block" style="margin-top:10px" href="/api/admin/backup/latest" download>下载最新数据库备份（${(backup.bytes / 1024).toFixed(0)} KB）</a>` : ''}</div>
+    <div class="card"><b>其他保护</b><p class="muted small" style="margin:6px 0 0">删除的账目、截图、游玩都先进回收站，30 天内可以恢复；每次改动都写进操作记录；数据库会拒绝保存分摊加起来不等于总额的账。</p></div>`);
+}
+async function tripTrashSheet() {
+  let r;
+  try { r = await api('GET', '/api/admin/trash'); } catch (e) { return toast(e.message, true); }
+  openSheet(`${sheetHead('回收站')}
+    <p class="muted small" style="margin-top:-6px">删除的游玩在这里保留 ${r.days} 天，之后连同截图永久删除。</p>
+    <div class="list">${r.trips.length ? r.trips.map((t) => `<div class="mem"><span class="main"><b>${esc(t.name)}</b>
+      <div class="s">${range(t)} · ${t.count} 笔 · 删于 ${fmtTime(t.deletedAt)}，${fmtTime(t.purgeAt)} 后永久删除</div></span>
+      <button class="btn small" data-tr="${t.id}">恢复</button></div>`).join('') : '<div class="empty small">回收站是空的</div>'}</div>`, (el) => {
+    el.querySelectorAll('[data-tr]').forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      try { await api('POST', `/api/admin/trips/${b.dataset.tr}/restore`); toast('已恢复'); closeSheet(); renderAdmin(); }
+      catch (e) { b.disabled = false; toast(e.message, true); }
     });
   });
 }
@@ -530,7 +578,7 @@ function expenseDetail(id) {
     el.querySelectorAll('[data-img]').forEach((b) => b.onclick = () => viewImage(`/api/t/${S.key}/images/${b.dataset.img}`));
     const del = el.querySelector('#ed-del');
     if (del) del.onclick = async () => {
-      if (!(await confirmSheet('删除这笔账？', `${esc(e.title || CAT[e.category].name)} ${money(e.cents)}，连同截图一起删除。操作记录里会留下记录。`, '删除', true))) return expenseDetail(id);
+      if (!(await confirmSheet('删除这笔账？', `${esc(e.title || CAT[e.category].name)} ${money(e.cents)}，连同截图一起删除。30 天内可以在「成员 → 最近删除」里恢复。`, '删除', true))) return expenseDetail(id);
       await act(() => api('DELETE', `/api/t/${S.key}/expenses/${id}`), '已删除').catch(() => {});
     };
     const ed = el.querySelector('#ed-edit');
@@ -713,7 +761,7 @@ function expenseForm(exp) {
       if (dn) { const [x] = newFiles.splice(Number(dn.dataset.delnew), 1); URL.revokeObjectURL(x.url); return drawImgs(); }
       const di = e.target.closest('[data-delimg]');
       if (di) {
-        if (!confirm('删除这张图片？')) return;
+        if (!confirm('删除这张图片？30 天内可以在「最近删除」里恢复。')) return;
         try { await api('DELETE', `/api/t/${S.key}/images/${di.dataset.delimg}`); await refresh(); drawImgs(); toast('图片已删除'); }
         catch (err) { toast(err.message, true); }
         return;
@@ -1100,6 +1148,7 @@ function renderPeople(body) {
       ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
       ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} ${BN()}</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
       <a class="item" id="pm-export" href="/api/t/${esc(S.key)}/export" download><span class="cat">📑</span><span class="main"><span class="t">导出 Excel</span><span class="s">账目明细、每人汇总、转账记录</span></span></a>
+      <button class="item" id="pm-trash"><span class="cat">🗑️</span><span class="main"><span class="t">最近删除</span><span class="s">误删的账目和截图 30 天内可以恢复</span></span></button>
       <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔</span></span></button>
       ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
     </div>
@@ -1108,7 +1157,7 @@ function renderPeople(body) {
     html += `<div class="section-title"><span>管理员</span></div><div class="list">
       ${t.locked ? '<button class="item" id="pa-unlock"><span class="cat">🔓</span><span class="main"><span class="t">解锁账单</span><span class="s">解锁后大家可以继续修改</span></span></button>' : ''}
       <button class="item" id="pa-rekey"><span class="cat">♻️</span><span class="main"><span class="t">重置分享链接</span><span class="s">旧链接立即失效，适合链接外泄时</span></span></button>
-      <button class="item" id="pa-del"><span class="cat">🗑️</span><span class="main"><span class="t" style="color:var(--danger)">删除这次游玩</span><span class="s">所有账目和截图都会删除，不能恢复</span></span></button></div>`;
+      <button class="item" id="pa-del"><span class="cat">🗑️</span><span class="main"><span class="t" style="color:var(--danger)">删除这次游玩</span><span class="s">先放进回收站，30 天内可以恢复</span></span></button></div>`;
   }
   body.innerHTML = html;
   body.querySelectorAll('[data-mem]').forEach((b) => b.onclick = () => memberSheet(Number(b.dataset.mem)));
@@ -1124,6 +1173,7 @@ function renderPeople(body) {
   }
   body.querySelector('#pm-share').onclick = () => shareLink(false);
   body.querySelector('#pm-log').onclick = logSheet;
+  body.querySelector('#pm-trash').onclick = trashSheet;
   if (ed && !d.payments.length) body.querySelector('#pm-base').onclick = baseSheet;
   if (ed) body.querySelectorAll('[data-rate]').forEach((b) => b.onclick = () => rateSheet(b.dataset.rate));
   const pe = body.querySelector('#pm-edit'); if (pe) pe.onclick = tripEditSheet;
@@ -1138,7 +1188,7 @@ function renderPeople(body) {
   };
   const pd = body.querySelector('#pa-del');
   if (pd) pd.onclick = async () => {
-    if (!(await confirmSheet(`删除「${esc(t.name)}」？`, `${d.expenses.length} 笔账目、所有截图和操作记录都会被删除，<b>不能恢复</b>。`, '永久删除', true))) return;
+    if (!(await confirmSheet(`删除「${esc(t.name)}」？`, `${d.expenses.length} 笔账目连同截图会放进回收站，分享链接立即打不开。<b>30 天内</b>可以在管理员菜单「回收站」恢复，之后永久删除。`, '删除', true))) return;
     try { await api('DELETE', `/api/admin/trips/${t.id}`); toast('已删除'); go('/'); }
     catch (e) { toast(e.message, true); }
   };
@@ -1276,6 +1326,23 @@ function memberSheet(id) {
   });
 }
 
+// 最近删除：误删的账目 / 截图可以恢复
+async function trashSheet() {
+  let r;
+  try { r = await api('GET', `/api/t/${S.key}/trash`); } catch (e) { return toast(e.message, true); }
+  const ed = editable();
+  openSheet(`${sheetHead('最近删除')}
+    <p class="muted small" style="margin-top:-6px">删掉的账目和截图会在这里保留 ${r.days} 天，之后自动清除。${ed ? '' : '账单已锁定，解锁后才能恢复。'}</p>
+    <div class="list">${r.items.length ? r.items.map((i) => `<div class="mem"><span class="main">${i.kind === 'image' ? '🖼️ ' : ''}${esc(i.label)}
+      <div class="s">${esc(i.deletedBy || '未署名')} 删于 ${fmtTime(i.deletedAt)}</div></span>
+      ${ed ? `<button class="btn small" data-restore="${i.id}">恢复</button>` : ''}</div>`).join('') : '<div class="empty small">没有删除过东西</div>'}</div>`, (el) => {
+    el.querySelectorAll('[data-restore]').forEach((b) => b.onclick = async () => {
+      b.disabled = true;
+      try { await api('POST', `/api/t/${S.key}/trash/${b.dataset.restore}/restore`); toast('已恢复'); await refresh(); trashSheet(); }
+      catch (e) { b.disabled = false; toast(e.message, true); }
+    });
+  });
+}
 async function logSheet() {
   openSheet(`${sheetHead('操作记录')}<div class="card" id="log-body"><p class="muted">加载中…</p></div>`, async (el) => {
     try {

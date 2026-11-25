@@ -151,3 +151,64 @@ CREATE TABLE IF NOT EXISTS invites (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE trips ADD COLUMN IF NOT EXISTS invite_id int REFERENCES invites(id) ON DELETE SET NULL;
+
+-- ===== v4：数据安全 =====
+-- 删除游玩先进回收站（deleted_at 不为空），30 天后才真正删除；期间管理员可以恢复
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+-- 删除的账目 / 截图先放这里（data 是删除前的完整快照，files 是对应的图片文件，文件保留不删），30 天后清理
+CREATE TABLE IF NOT EXISTS trash (
+  id         serial PRIMARY KEY,
+  trip_id    int  NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  kind       text NOT NULL CHECK (kind IN ('expense','image')),
+  label      text NOT NULL,
+  data       jsonb NOT NULL,
+  files      text[] NOT NULL DEFAULT '{}',
+  deleted_by text NOT NULL DEFAULT '',
+  deleted_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS trash_trip ON trash(trip_id, id);
+
+-- 数据库层面的金额校验（事务提交时检查，不满足就整笔回滚，代码有 bug 也存不进错账）：
+--   每笔账至少一人分摊；各人分摊（结算币种、原币）加起来正好等于这笔的金额；没有负数；
+--   付款人、分摊人、转账双方都是这次游玩的成员；转账双方不是同一人
+CREATE OR REPLACE FUNCTION aa_check_expense() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE eid int; e record; s record;
+BEGIN
+  IF TG_TABLE_NAME = 'expenses' THEN
+    eid := CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END;
+  ELSE
+    eid := CASE WHEN TG_OP = 'DELETE' THEN OLD.expense_id ELSE NEW.expense_id END;
+  END IF;
+  SELECT x.id, x.trip_id, x.cents, x.orig_cents, m.trip_id AS payer_trip INTO e
+    FROM expenses x JOIN members m ON m.id = x.payer_id WHERE x.id = eid;
+  IF NOT FOUND THEN RETURN NULL; END IF;  -- 这笔已经整笔删除
+  IF e.payer_trip <> e.trip_id THEN
+    RAISE EXCEPTION 'aa_invariant: 账目 % 的付款人不是这次游玩的成员', eid;
+  END IF;
+  SELECT count(*) AS n, coalesce(sum(es.cents), 0) AS c, coalesce(sum(es.orig_cents), 0) AS o,
+         count(*) FILTER (WHERE m.trip_id <> e.trip_id) AS outsider,
+         count(*) FILTER (WHERE es.cents < 0 OR es.orig_cents IS NULL OR es.orig_cents < 0) AS neg
+    INTO s FROM expense_shares es JOIN members m ON m.id = es.member_id WHERE es.expense_id = eid;
+  IF s.n = 0 OR s.c <> e.cents OR s.o <> e.orig_cents OR s.outsider > 0 OR s.neg > 0 THEN
+    RAISE EXCEPTION 'aa_invariant: 账目 % 分摊不平（% 人，合计 %/%，总额 %/%）', eid, s.n, s.c, s.o, e.cents, e.orig_cents;
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE OR REPLACE FUNCTION aa_check_payment() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.from_id = NEW.to_id
+     OR NOT EXISTS (SELECT 1 FROM members WHERE id = NEW.from_id AND trip_id = NEW.trip_id)
+     OR NOT EXISTS (SELECT 1 FROM members WHERE id = NEW.to_id AND trip_id = NEW.trip_id) THEN
+    RAISE EXCEPTION 'aa_invariant: 转账 % 的双方不对', NEW.id;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS aa_expense_check ON expenses;
+CREATE CONSTRAINT TRIGGER aa_expense_check AFTER INSERT OR UPDATE ON expenses
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION aa_check_expense();
+DROP TRIGGER IF EXISTS aa_share_check ON expense_shares;
+CREATE CONSTRAINT TRIGGER aa_share_check AFTER INSERT OR UPDATE OR DELETE ON expense_shares
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION aa_check_expense();
+DROP TRIGGER IF EXISTS aa_payment_check ON payments;
+CREATE CONSTRAINT TRIGGER aa_payment_check AFTER INSERT OR UPDATE ON payments
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION aa_check_payment();

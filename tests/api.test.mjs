@@ -242,6 +242,90 @@ key = newKey;
 // CSRF：非 JSON 被拒
 r = await fetch(BASE + `/api/t/${key}/lock`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' }); ok('非 JSON 被拒', r.status === 415);
 
+// ===== v4 数据安全 =====
+{
+  cookie = adminCookie;
+  let t = await call('POST', '/api/admin/trips', { name: 'zz回收站', startDay: '2026-11-10', members: ['zz甲', 'zz乙', 'zz丙'] });
+  const tk = t.data.key, tid = t.data.id;
+  cookie = '';
+  let d = (await call('GET', `/api/t/${tk}`)).data; const [m1, m2, m3] = d.members.map((m) => m.id);
+  // 并发：10 个人同时第一次用日元记账、各自带不同汇率 → 只能有一个汇率生效，所有账都按它算
+  const rs = await Promise.all(Array.from({ length: 10 }, (_, i) => call('POST', `/api/t/${tk}/expenses`, { amount: String(1000 + i * 7), currency: 'JPY', rate: (0.046 + i / 10000).toFixed(4), payerId: [m1, m2, m3][i % 3],
+    shares: [m3, m1, m2].map((id) => ({ memberId: id, weight: 1 })) })));
+  ok('并发记账都成功', rs.every((x) => x.status === 200), rs.map((x) => x.status).join());
+  d = (await call('GET', `/api/t/${tk}`)).data;
+  const rate = d.rates.JPY.rate;
+  ok('并发下汇率统一', d.expenses.every((e) => e.rate === rate && e.cents === Math.round(e.origCents * rate)), JSON.stringify(d.expenses.map((e) => e.rate)));
+  // 并发改汇率 + 记账
+  await Promise.all([call('PUT', `/api/t/${tk}/rates/JPY`, { rate: '0.05' }), call('POST', `/api/t/${tk}/expenses`, { amount: '3000', currency: 'JPY', payerId: m1, shares: [m1, m2].map((id) => ({ memberId: id, weight: 1 })) })]);
+  d = (await call('GET', `/api/t/${tk}`)).data;
+  ok('并发改汇率后全部按新汇率', d.expenses.length === 11 && d.expenses.every((e) => e.rate === 0.05 && e.cents === Math.round(e.origCents * 0.05)));
+  // 删账 → 回收站 → 恢复
+  const ex = d.expenses.find((e) => e.origCents === 300000);
+  await call('POST', `/api/t/${tk}/expenses/${ex.id}/images`, null, { raw: PNG });
+  let r2 = await call('DELETE', `/api/t/${tk}/expenses/${ex.id}`, undefined, { actor: m2 });
+  ok('删账', r2.status === 200);
+  r2 = await call('GET', `/api/t/${tk}/trash`);
+  const tr = r2.data.items[0];
+  ok('回收站里有这笔', r2.data.items.length === 1 && tr.kind === 'expense' && tr.deletedBy === 'zz乙', JSON.stringify(r2.data));
+  r2 = await call('GET', `/api/t/${key}/trash`); ok('别的游玩看不到', !r2.data.items?.some((i) => i.id === tr.id));
+  r2 = await call('POST', `/api/t/${key}/trash/${tr.id}/restore`, {}); ok('不能从别的游玩恢复', r2.status === 404);
+  // 删除期间改了汇率，恢复时按现在的汇率重算
+  await call('PUT', `/api/t/${tk}/rates/JPY`, { rate: '0.048' });
+  r2 = await call('POST', `/api/t/${tk}/trash/${tr.id}/restore`, {}, { actor: m1 });
+  ok('恢复', r2.status === 200, JSON.stringify(r2.data));
+  d = (await call('GET', `/api/t/${tk}`)).data;
+  const back = d.expenses.find((e) => e.id === ex.id);
+  ok('恢复后内容、图片、日期都在', back && back.origCents === 300000 && back.images.length === 1 && back.day === ex.day && back.cents === 14400, JSON.stringify(back));
+  ok('恢复后分摊平', back.shares.reduce((a, x) => a + x.cents, 0) === back.cents);
+  r2 = await call('GET', `/api/t/${tk}/images/${back.images[0]}`); ok('恢复后图片能打开', r2.status === 200);
+  r2 = await call('POST', `/api/t/${tk}/trash/${tr.id}/restore`, {}); ok('不能恢复两次', r2.status === 404);
+  // 删图 → 恢复
+  await call('DELETE', `/api/t/${tk}/images/${back.images[0]}`);
+  r2 = await call('GET', `/api/t/${tk}/trash`); const ti = r2.data.items.find((i) => i.kind === 'image');
+  ok('删图进回收站', !!ti);
+  await call('POST', `/api/t/${tk}/trash/${ti.id}/restore`, {});
+  d = (await call('GET', `/api/t/${tk}`)).data;
+  ok('恢复图片', d.expenses.find((e) => e.id === ex.id).images.length === 1);
+  r2 = await call('GET', `/api/t/${tk}/log`); ok('恢复写进操作记录', r2.data.items.some((i) => /恢复了一笔/.test(i.detail)));
+  // 换结算币种后再恢复：按新币种重算
+  const ex2 = d.expenses.find((e) => e.origCents === 100000);
+  await call('DELETE', `/api/t/${tk}/expenses/${ex2.id}`);
+  r2 = await call('PUT', `/api/t/${tk}/base`, { currency: 'JPY', rate: '21' }); ok('换结算币种', r2.status === 200, JSON.stringify(r2.data));
+  const tr2 = (await call('GET', `/api/t/${tk}/trash`)).data.items.find((i) => i.kind === 'expense');
+  r2 = await call('POST', `/api/t/${tk}/trash/${tr2.id}/restore`, {}); ok('换币种后恢复', r2.status === 200, JSON.stringify(r2.data));
+  d = (await call('GET', `/api/t/${tk}`)).data;
+  const b2 = d.expenses.find((e) => e.id === ex2.id);
+  ok('换币种后恢复按新币种', b2 && b2.currency === 'JPY' && b2.cents === 100000 && b2.rate === 1, JSON.stringify(b2));
+  ok('换币种后总账平', d.balances.reduce((a, b) => a + b.net, 0) === 0);
+  // 太大的金额被拒，而不是数据库报错
+  r2 = await call('POST', `/api/t/${tk}/expenses`, { amount: '9999999', currency: 'USD', rate: '150', payerId: m1, shares: [{ memberId: m1, weight: 1 }] });
+  ok('超大金额被拒', r2.status === 400, JSON.stringify(r2.data));
+  // 锁定后不能恢复
+  const ex3 = d.expenses[0];
+  await call('DELETE', `/api/t/${tk}/expenses/${ex3.id}`);
+  await call('POST', `/api/t/${tk}/lock`, {});
+  const tr3 = (await call('GET', `/api/t/${tk}/trash`)).data.items[0];
+  r2 = await call('POST', `/api/t/${tk}/trash/${tr3.id}/restore`, {}); ok('锁定后不能恢复', r2.status === 423);
+  // 数据校验
+  cookie = adminCookie;
+  r2 = await call('GET', '/api/admin/health');
+  ok('数据校验通过', r2.status === 200 && r2.data.check.ok, JSON.stringify(r2.data.check?.problems));
+  ok('能看到最近备份', !!r2.data.backup?.file);
+  cookie = ''; r2 = await call('GET', '/api/admin/health'); ok('非管理员看不到校验', r2.status === 401);
+  r2 = await call('GET', '/api/admin/backup/latest'); ok('非管理员不能下载备份', r2.status === 401);
+  cookie = adminCookie;
+  r2 = await call('GET', '/api/admin/backup/latest'); ok('下载备份', r2.status === 200 && r2.data[0] === 0x1f && r2.data[1] === 0x8b);
+  // 删除游玩 → 回收站 → 恢复
+  r2 = await call('DELETE', `/api/admin/trips/${tid}`); ok('删除游玩', r2.status === 200);
+  r2 = await call('GET', `/api/t/${tk}`); ok('删除后链接打不开', r2.status === 404);
+  r2 = await call('GET', '/api/admin/trips'); ok('列表里不显示', !r2.data.trips.some((x) => x.id === tid));
+  r2 = await call('GET', '/api/admin/trash'); ok('回收站里有', r2.data.trips.some((x) => x.id === tid && x.count === 10));
+  r2 = await call('POST', `/api/admin/trips/${tid}/restore`, {}); ok('恢复游玩', r2.status === 200);
+  r2 = await call('GET', `/api/t/${tk}`); ok('恢复后数据都在', r2.status === 200 && r2.data.expenses.length === 10);
+  await call('DELETE', `/api/admin/trips/${tid}`);
+}
+
 // 删除游玩（连同图片）
 r = await call('DELETE', `/api/admin/trips/${tripId}`); ok('删除游玩', r.status === 200);
 r = await call('GET', `/api/t/${key}`); ok('删除后 404', r.status === 404);

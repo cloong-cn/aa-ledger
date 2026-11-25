@@ -16,6 +16,9 @@ const SESSION_DAYS = 30;
 const UPLOADS = process.env.UPLOADS || '/srv/aa/uploads';
 const MAX_IMAGE = 6 * 1024 * 1024;
 const MAX_IMAGES_PER_EXPENSE = 9;
+const MAX_CENTS = 1e9;          // 单笔上限（数据库 int 列能放下 21 亿分）
+const TRASH_DAYS = 30;         // 删除的东西保留多少天
+const BACKUPS = process.env.BACKUPS || '/srv/aa/backups';
 
 const db = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'aa', max: 5 });
 
@@ -122,6 +125,17 @@ async function tx(fn) {
   catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; }
   finally { c.release(); }
 }
+// 改某次游玩的数据都走这里：先锁住这次游玩那一行（FOR UPDATE），同一次游玩的修改一个一个排队执行，
+// 避免两个人同时改汇率 / 结算币种 / 记账时互相覆盖算错。锁住后重新读一遍状态（是否锁定、结算币种）
+async function tripTx(trip, fn, { open = true } = {}) {
+  return tx(async (q) => {
+    const { rows: [t] } = await q.query(`SELECT locked, base_currency, deleted_at FROM trips WHERE id=$1 FOR UPDATE`, [trip.id]);
+    if (!t || t.deleted_at) throw new HttpError(404, '这次游玩不存在（可能已被删除）');
+    trip.locked = t.locked; trip.base_currency = t.base_currency;
+    if (open) assertOpen(trip);
+    return fn(q);
+  });
+}
 
 // ---------- 图片 ----------
 function sniffImage(buf) {
@@ -219,7 +233,7 @@ route('POST', '/api/password', async ({ admin, body }) => {
 
 // ---------- 游玩数据 ----------
 async function loadTrip(key) {
-  const { rows: [t] } = await db.query(`SELECT *, to_char(start_day,'YYYY-MM-DD') AS start_s, to_char(end_day,'YYYY-MM-DD') AS end_s FROM trips WHERE key=$1`, [key]);
+  const { rows: [t] } = await db.query(`SELECT *, to_char(start_day,'YYYY-MM-DD') AS start_s, to_char(end_day,'YYYY-MM-DD') AS end_s FROM trips WHERE key=$1 AND deleted_at IS NULL`, [key]);
   if (!t) throw new HttpError(404, '链接无效：这次游玩不存在，或者链接已被重置');
   return t;
 }
@@ -289,7 +303,7 @@ route('PATCH', '/api/t/:key', async ({ params, body, req, admin }) => {
   const end = body.endDay ? body.endDay : null;
   if (end && (!validDay(end) || end < body.startDay)) throw bad('结束日期不对');
   const note = cleanText(body.note, 500);
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     await q.query(`UPDATE trips SET name=$1,start_day=$2,end_day=$3,note=$4 WHERE id=$5`, [name, body.startDay, end, note, trip.id]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.edit', `修改了游玩信息：${name}，${body.startDay}${end ? ' ~ ' + end : ''}`);
   });
@@ -308,7 +322,7 @@ route('POST', '/api/t/:key/members', async ({ params, body, req, admin }) => {
   if (!name) throw bad('请输入名字');
   const weight = body.weight == null ? 1 : parseWeight(body.weight);
   if (!weight) throw bad('份数要大于 0');
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const pid = await findOrCreatePerson(q, name);
     const { rows: [m] } = await q.query(`INSERT INTO members(trip_id,person_id,weight) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING id`, [trip.id, pid, weight]);
     if (!m) throw bad(`${name} 已经在名单里了`);
@@ -323,7 +337,7 @@ route('PATCH', '/api/t/:key/members/:id', async ({ params, body, req, admin }) =
   assertOpen(trip);
   const weight = parseWeight(body.weight);
   if (!weight) throw bad('份数要大于 0');
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const m = mm.get(params.id);
     if (!m) throw new HttpError(404, '成员不存在');
@@ -335,7 +349,7 @@ route('PATCH', '/api/t/:key/members/:id', async ({ params, body, req, admin }) =
 route('DELETE', '/api/t/:key/members/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     const m = (await memberMap(q, trip.id)).get(params.id);
     if (!m) throw new HttpError(404, '成员不存在');
     const { rows: [{ used }] } = await q.query(`SELECT
@@ -360,7 +374,7 @@ route('PUT', '/api/t/:key/paycode/:id/:kind', async ({ params, rawBody, req, adm
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
   const img = saveImage(rawBody);
-  const old = await tx(async (q) => {
+  const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`SELECT file FROM pay_codes WHERE person_id=$1 AND kind=$2`, [m.person_id, params.kind]);
     await q.query(`INSERT INTO pay_codes(person_id,kind,file,mime,updated_at) VALUES($1,$2,$3,$4,now())
       ON CONFLICT (person_id,kind) DO UPDATE SET file=EXCLUDED.file, mime=EXCLUDED.mime, updated_at=now()`, [m.person_id, params.kind, img.file, img.mime]);
@@ -374,7 +388,7 @@ route('DELETE', '/api/t/:key/paycode/:id/:kind', async ({ params, req, admin }) 
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
-  const old = await tx(async (q) => {
+  const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`DELETE FROM pay_codes WHERE person_id=$1 AND kind=$2 RETURNING file`, [m.person_id, params.kind]);
     if (o) await log(q, trip.id, await actorName(q, trip, req, admin), 'paycode.remove', `删除了 ${m.name} 的${KIND_CN[params.kind]}收款码`);
     return o;
@@ -420,6 +434,7 @@ function parseExpense(body, mm, today, rate, base) {
     cents = roundTo(origCents * rate, bu);
     if (cents < 1) throw bad(`折合${CURRENCIES[base].name}金额太小`);
   }
+  if (cents > MAX_CENTS) throw bad('金额太大了');
   const seen = new Set();
   const parts = body.shares.map((s) => {
     const memberId = Number(s?.memberId);
@@ -483,7 +498,7 @@ async function tripRate(q, trip, currency, bodyRate, actor) {
 route('POST', '/api/t/:key/expenses', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const actor = await actorName(q, trip, req, admin);
     const rate = await tripRate(q, trip, body.currency, body.rate, actor);
@@ -499,7 +514,7 @@ route('POST', '/api/t/:key/expenses', async ({ params, body, req, admin }) => {
 route('PUT', '/api/t/:key/expenses/:id', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const actor = await actorName(q, trip, req, admin);
     const old = await loadExpense(q, trip, params.id);
@@ -521,7 +536,7 @@ route('PUT', '/api/t/:key/rates/:cur', async ({ params, body, req, admin }) => {
   if (!CURRENCIES[cur] || cur === trip.base_currency) throw bad('币种不对');
   const rate = parseRate(body.rate);
   if (!rate) throw bad('汇率不对');
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const { rows: [old] } = await q.query(`SELECT rate::float AS rate FROM trip_rates WHERE trip_id=$1 AND currency=$2`, [trip.id, cur]);
     await q.query(`INSERT INTO trip_rates(trip_id,currency,rate,updated_at) VALUES($1,$2,$3,now())
       ON CONFLICT (trip_id,currency) DO UPDATE SET rate=EXCLUDED.rate, updated_at=now()`, [trip.id, cur, rate]);
@@ -529,6 +544,7 @@ route('PUT', '/api/t/:key/rates/:cur', async ({ params, body, req, admin }) => {
     for (const e of exps) {
       const bu = unitOf(trip.base_currency);
       const cents = Math.max(bu, roundTo(e.orig_cents * rate, bu));
+      if (cents > MAX_CENTS) throw bad('换算后有一笔金额太大了');
       const { rows: sh } = await q.query(`SELECT member_id, weight::float AS weight, fixed_cents FROM expense_shares WHERE expense_id=$1 ORDER BY member_id`, [e.id]);
       // 按原来的录入顺序无关紧要：分摊只取决于份数/指定金额
       const shares = splitExpense(e.orig_cents, cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })), unitOf(cur), bu);
@@ -550,7 +566,7 @@ route('PUT', '/api/t/:key/base', async ({ params, body, req, admin }) => {
   const from = trip.base_currency, to = body.currency;
   if (!CURRENCIES[to]) throw bad('币种不对');
   if (to === from) return { ok: true, recomputed: 0 };
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM payments WHERE trip_id=$1`, [trip.id]);
     if (n) throw bad('已经有转账记录了，不能再换结算币种。先撤销所有「已转」再试');
     const conv = body.rate != null && body.rate !== '' ? parseRate(body.rate) : crossRate(await liveRates(), from, to);
@@ -628,15 +644,20 @@ route('GET', '/api/t/:key/export', async ({ params, admin }) => {
 route('DELETE', '/api/t/:key/expenses/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  const files = await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const old = await loadExpense(q, trip, params.id);
-    const { rows } = await q.query(`SELECT file FROM images WHERE expense_id=$1`, [old.id]);
+    const { rows: [row] } = await q.query(`SELECT *, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1`, [old.id]);
+    const { rows: shares } = await q.query(`SELECT * FROM expense_shares WHERE expense_id=$1`, [old.id]);
+    const { rows: images } = await q.query(`SELECT * FROM images WHERE expense_id=$1 ORDER BY id`, [old.id]);
+    const actor = await actorName(q, trip, req, admin);
+    const label = describeExp(old, mm, trip.base_currency);
+    // 删除前把完整内容放进回收站（图片文件不删），30 天内可以恢复
+    await q.query(`INSERT INTO trash(trip_id,kind,label,data,files,deleted_by) VALUES($1,'expense',$2,$3,$4,$5)`,
+      [trip.id, label, JSON.stringify({ base: trip.base_currency, expense: row, shares, images }), images.map((i) => i.file), actor]);
     await q.query(`DELETE FROM expenses WHERE id=$1`, [old.id]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'expense.remove', `删除了一笔：${describeExp(old, mm, trip.base_currency)}`);
-    return rows.map((r) => r.file);
+    await log(q, trip.id, actor, 'expense.remove', `删除了一笔：${label}（${TRASH_DAYS} 天内可在「最近删除」恢复）`);
   });
-  removeFiles(files);
   return { ok: true };
 });
 
@@ -645,7 +666,7 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const img = saveImage(rawBody);
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const e = await loadExpense(q, trip, params.id);
     const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
     if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`每笔最多 ${MAX_IMAGES_PER_EXPENSE} 张图`);
@@ -657,14 +678,16 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
 route('DELETE', '/api/t/:key/images/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  const file = await tx(async (q) => {
-    const { rows: [i] } = await q.query(`SELECT i.id, i.file, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
+  await tripTx(trip, async (q) => {
+    const { rows: [i] } = await q.query(`SELECT i.*, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
     if (!i) throw new HttpError(404, '图片不存在');
+    const actor = await actorName(q, trip, req, admin);
+    const label = `「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」的一张图`;
+    await q.query(`INSERT INTO trash(trip_id,kind,label,data,files,deleted_by) VALUES($1,'image',$2,$3,$4,$5)`,
+      [trip.id, label, JSON.stringify({ image: { id: i.id, expense_id: i.expense_id, file: i.file, mime: i.mime, bytes: i.bytes, created_at: i.created_at } }), [i.file], actor]);
     await q.query(`DELETE FROM images WHERE id=$1`, [i.id]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.remove', `删除了「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」的一张图`);
-    return i.file;
+    await log(q, trip.id, actor, 'image.remove', `删除了${label}`);
   });
-  removeFiles([file]);
   return { ok: true };
 });
 route('GET', '/api/t/:key/images/:id', async ({ params }) => {
@@ -674,11 +697,53 @@ route('GET', '/api/t/:key/images/:id', async ({ params }) => {
   return { __image: i };
 });
 
+// ---------- 最近删除（回收站） ----------
+route('GET', '/api/t/:key/trash', async ({ params }) => {
+  const trip = await loadTrip(params.key);
+  const { rows } = await db.query(`SELECT id, kind, label, deleted_by AS "deletedBy", deleted_at AS "deletedAt",
+    deleted_at + make_interval(days => $2) AS "purgeAt" FROM trash WHERE trip_id=$1 ORDER BY id DESC`, [trip.id, TRASH_DAYS]);
+  return { items: rows, days: TRASH_DAYS };
+});
+route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) => {
+  const trip = await loadTrip(params.key);
+  return tripTx(trip, async (q) => {
+    const { rows: [t] } = await q.query(`DELETE FROM trash WHERE id=$1 AND trip_id=$2 RETURNING *`, [params.id, trip.id]);
+    if (!t) throw new HttpError(404, '这条删除记录不存在（可能已经恢复过了）');
+    const actor = await actorName(q, trip, req, admin);
+    if (t.kind === 'image') {
+      const i = t.data.image;
+      const { rows: [e] } = await q.query(`SELECT id FROM expenses WHERE id=$1 AND trip_id=$2`, [i.expense_id, trip.id]);
+      if (!e) throw bad('这张图所属的账目已经删除了，先恢复那笔账');
+      const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
+      if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`这笔账已经有 ${MAX_IMAGES_PER_EXPENSE} 张图了`);
+      await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,created_at) VALUES($1,$2,$3,$4,$5,$6)`, [i.id, e.id, i.file, i.mime, i.bytes, i.created_at]);
+    } else {
+      const { expense: x, shares, images } = t.data;
+      const mm = await memberMap(q, trip.id);
+      if (!mm.has(x.payer_id) || shares.some((s) => !mm.has(s.member_id))) throw bad('这笔账涉及的成员已经被移除了，没法直接恢复');
+      // 按现在的汇率 / 结算币种重新算一遍，保证跟这次游玩的其他账目一致
+      const base = trip.base_currency, bu = unitOf(base);
+      let cents, rate = 1, override = false;
+      if (x.currency === base) cents = x.orig_cents;
+      else if (x.cny_override && t.data.base === base) { cents = x.cents; rate = Number(x.rate); override = true; }
+      else { rate = await tripRate(q, trip, x.currency, null, actor); cents = Math.max(bu, roundTo(x.orig_cents * rate, bu)); }
+      const split = splitExpense(x.orig_cents, cents, shares.map((s) => ({ memberId: s.member_id, weight: s.fixed_cents != null ? 0 : Number(s.weight), fixed: s.fixed_cents })), unitOf(x.currency), bu);
+      await q.query(`INSERT INTO expenses(id,trip_id,payer_id,cents,category,title,note,day,created_by,created_at,updated_at,currency,orig_cents,rate,cny_override)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14)`,
+        [x.id, trip.id, x.payer_id, cents, x.category, x.title, x.note, x.day, x.created_by, x.created_at, x.currency, x.orig_cents, rate, override]);
+      await writeShares(q, x.id, split);
+      for (const i of images) await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,created_at) VALUES($1,$2,$3,$4,$5,$6)`, [i.id, x.id, i.file, i.mime, i.bytes, i.created_at]);
+    }
+    await log(q, trip.id, actor, t.kind + '.restore', `恢复了${t.kind === 'image' ? '' : '一笔：'}${t.label}`);
+    return { ok: true };
+  });
+});
+
 // ---------- 转账（结算） ----------
 route('POST', '/api/t/:key/payments', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  return tx(async (q) => {
+  return tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const from = mm.get(Number(body.fromId)), to = mm.get(Number(body.toId));
     if (!from || !to || from.id === to.id) throw bad('转账双方不对');
@@ -694,7 +759,7 @@ route('POST', '/api/t/:key/payments', async ({ params, body, req, admin }) => {
 route('DELETE', '/api/t/:key/payments/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const { rows: [p] } = await q.query(`DELETE FROM payments WHERE id=$1 AND trip_id=$2 RETURNING *`, [params.id, trip.id]);
     if (!p) throw new HttpError(404, '这条转账不存在');
@@ -707,7 +772,7 @@ route('DELETE', '/api/t/:key/payments/:id', async ({ params, req, admin }) => {
 route('POST', '/api/t/:key/lock', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     await q.query(`UPDATE trips SET locked=true, locked_at=now() WHERE id=$1`, [trip.id]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.lock', '锁定了账单');
   });
@@ -715,10 +780,10 @@ route('POST', '/api/t/:key/lock', async ({ params, req, admin }) => {
 });
 route('POST', '/api/t/:key/unlock', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
-  await tx(async (q) => {
+  await tripTx(trip, async (q) => {
     await q.query(`UPDATE trips SET locked=false, locked_at=NULL WHERE id=$1`, [trip.id]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.unlock', '解锁了账单');
-  });
+  }, { open: false });
   return { ok: true };
 }, { auth: 'admin' });
 
@@ -733,14 +798,14 @@ route('GET', '/api/admin/trips', async () => {
   const { rows: trips } = await db.query(`SELECT t.id, t.key, t.name, to_char(start_day,'YYYY-MM-DD') AS "startDay", to_char(end_day,'YYYY-MM-DD') AS "endDay",
     locked, base_currency AS base, i.note AS "inviteNote", (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members,
     (SELECT count(*)::int FROM expenses WHERE trip_id=t.id) AS count,
-    (SELECT COALESCE(sum(cents),0)::int FROM expenses WHERE trip_id=t.id) AS total
-    FROM trips t LEFT JOIN invites i ON i.id=t.invite_id ORDER BY start_day DESC, t.id DESC`);
+    (SELECT COALESCE(sum(cents),0)::float8 FROM expenses WHERE trip_id=t.id) AS total
+    FROM trips t LEFT JOIN invites i ON i.id=t.invite_id WHERE t.deleted_at IS NULL ORDER BY start_day DESC, t.id DESC`);
   // 每人净额 = 付出 - 应摊 + 已转出 - 已收到；未结清金额 = 所有正净额之和
   const { rows: flows } = await db.query(`
-    SELECT trip_id, payer_id AS m, sum(cents)::int AS c FROM expenses GROUP BY 1,2
-    UNION ALL SELECT e.trip_id, s.member_id, -sum(s.cents)::int FROM expense_shares s JOIN expenses e ON e.id=s.expense_id GROUP BY 1,2
-    UNION ALL SELECT trip_id, from_id, sum(cents)::int FROM payments GROUP BY 1,2
-    UNION ALL SELECT trip_id, to_id, -sum(cents)::int FROM payments GROUP BY 1,2`);
+    SELECT trip_id, payer_id AS m, sum(cents)::float8 AS c FROM expenses GROUP BY 1,2
+    UNION ALL SELECT e.trip_id, s.member_id, -sum(s.cents)::float8 FROM expense_shares s JOIN expenses e ON e.id=s.expense_id GROUP BY 1,2
+    UNION ALL SELECT trip_id, from_id, sum(cents)::float8 FROM payments GROUP BY 1,2
+    UNION ALL SELECT trip_id, to_id, -sum(cents)::float8 FROM payments GROUP BY 1,2`);
   const net = new Map();
   for (const r of flows) {
     if (!net.has(r.trip_id)) net.set(r.trip_id, new Map());
@@ -843,18 +908,128 @@ route('POST', '/api/admin/trips/:id/rekey', async ({ params }) => {
   return { key };
 }, { auth: 'admin' });
 
+// 删除游玩：先进回收站，TRASH_DAYS 天后由 purgeTrash() 真正删除
 route('DELETE', '/api/admin/trips/:id', async ({ params }) => {
+  const { rowCount } = await db.query(`UPDATE trips SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL`, [params.id]);
+  if (!rowCount) throw new HttpError(404, '游玩不存在');
+  await log(db, params.id, '管理员', 'trip.delete', `删除了这次游玩（${TRASH_DAYS} 天内可在管理员「回收站」恢复）`);
+  return { ok: true };
+}, { auth: 'admin' });
+route('POST', '/api/admin/trips/:id/restore', async ({ params }) => {
+  const { rowCount } = await db.query(`UPDATE trips SET deleted_at=NULL WHERE id=$1 AND deleted_at IS NOT NULL`, [params.id]);
+  if (!rowCount) throw new HttpError(404, '回收站里没有这次游玩');
+  await log(db, params.id, '管理员', 'trip.restore', '从回收站恢复了这次游玩');
+  return { ok: true };
+}, { auth: 'admin' });
+route('GET', '/api/admin/trash', async () => {
+  const { rows } = await db.query(`SELECT t.id, t.name, to_char(start_day,'YYYY-MM-DD') AS "startDay", to_char(end_day,'YYYY-MM-DD') AS "endDay",
+    t.deleted_at AS "deletedAt", t.deleted_at + make_interval(days => $1) AS "purgeAt", (SELECT count(*)::int FROM expenses WHERE trip_id=t.id) AS count
+    FROM trips t WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC`, [TRASH_DAYS]);
+  return { trips: rows, days: TRASH_DAYS };
+}, { auth: 'admin' });
+
+// 回收站到期清理：删除超过 TRASH_DAYS 天的游玩和账目 / 截图（这时才删图片文件）
+async function purgeTrash() {
   const files = await tx(async (q) => {
-    const { rows } = await q.query(`SELECT i.file FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1`, [params.id]);
-    await q.query(`DELETE FROM expense_shares WHERE expense_id IN (SELECT id FROM expenses WHERE trip_id=$1)`, [params.id]);
-    await q.query(`DELETE FROM expenses WHERE trip_id=$1`, [params.id]);
-    await q.query(`DELETE FROM payments WHERE trip_id=$1`, [params.id]);
-    const { rowCount } = await q.query(`DELETE FROM trips WHERE id=$1`, [params.id]);
-    if (!rowCount) throw new HttpError(404, '游玩不存在');
-    return rows.map((r) => r.file);
+    const { rows: trips } = await q.query(`SELECT id FROM trips WHERE deleted_at < now() - make_interval(days => $1)`, [TRASH_DAYS]);
+    const ids = trips.map((t) => t.id);
+    const { rows: f1 } = await q.query(`SELECT i.file FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id = ANY($1)
+      UNION ALL SELECT unnest(files) FROM trash WHERE trip_id = ANY($1)
+      UNION ALL SELECT unnest(files) FROM trash WHERE deleted_at < now() - make_interval(days => $2)`, [ids, TRASH_DAYS]);
+    await q.query(`DELETE FROM trash WHERE trip_id = ANY($1) OR deleted_at < now() - make_interval(days => $2)`, [ids, TRASH_DAYS]);
+    await q.query(`DELETE FROM expense_shares WHERE expense_id IN (SELECT id FROM expenses WHERE trip_id = ANY($1))`, [ids]);
+    await q.query(`DELETE FROM expenses WHERE trip_id = ANY($1)`, [ids]);
+    await q.query(`DELETE FROM payments WHERE trip_id = ANY($1)`, [ids]);
+    await q.query(`DELETE FROM trips WHERE id = ANY($1)`, [ids]);
+    return f1.map((r) => r.file);
   });
   removeFiles(files);
-  return { ok: true };
+  return files.length;
+}
+
+// ---------- 数据校验 ----------
+// 把数据库里所有账目按存下来的份数 / 指定金额 / 汇率重新算一遍，跟存的结果逐分比对；再检查每次游玩收支平衡、图片文件都在。
+// node server.js check 和管理员页面顶部的「数据校验」都用它。返回 { ok, problems[], counts }
+async function verifyData() {
+  const [{ rows: trips }, { rows: exps }, { rows: shares }, { rows: pays }, { rows: mems }, { rows: rates }, { rows: files }] = await Promise.all([
+    db.query(`SELECT id, name, base_currency AS base FROM trips`),
+    db.query(`SELECT id, trip_id, payer_id, cents, currency, orig_cents, rate::float AS rate, cny_override FROM expenses ORDER BY id`),
+    db.query(`SELECT expense_id, member_id, weight::float AS weight, fixed_cents, orig_cents, cents FROM expense_shares`),
+    db.query(`SELECT id, trip_id, from_id, to_id, cents FROM payments`),
+    db.query(`SELECT id, trip_id FROM members`),
+    db.query(`SELECT trip_id, currency, rate::float AS rate FROM trip_rates`),
+    db.query(`SELECT file FROM images UNION SELECT file FROM pay_codes UNION SELECT unnest(files) FROM trash`),
+  ]);
+  const problems = [];
+  const tripById = new Map(trips.map((t) => [t.id, t]));
+  const where = (t) => `「${t?.name ?? '?'}」`;
+  const rateOf = new Map(rates.map((r) => [`${r.trip_id}|${r.currency}`, r.rate]));
+  const sharesOf = new Map();
+  for (const s of shares) { if (!sharesOf.has(s.expense_id)) sharesOf.set(s.expense_id, []); sharesOf.get(s.expense_id).push(s); }
+  const byTrip = new Map(trips.map((t) => [t.id, { members: [], expenses: [], payments: [] }]));
+  for (const m of mems) byTrip.get(m.trip_id)?.members.push(m.id);
+  for (const e of exps) {
+    const t = tripById.get(e.trip_id), base = t.base, bu = unitOf(base), ou = unitOf(e.currency);
+    const tag = `${where(t)} 账目 #${e.id}`;
+    const sh = sharesOf.get(e.id) || [];
+    if (e.orig_cents % ou || e.cents % bu) problems.push(`${tag}：金额不是整${bu > 1 || ou > 1 ? '円' : '分'}`);
+    if (e.currency === base) {
+      if (e.cents !== e.orig_cents || e.rate !== 1 || e.cny_override) problems.push(`${tag}：同币种账目的折算金额不对`);
+    } else if (!e.cny_override) {
+      const r = rateOf.get(`${e.trip_id}|${e.currency}`);
+      if (r == null) problems.push(`${tag}：缺少 ${e.currency} 的汇率`);
+      else {
+        if (Math.abs(r - e.rate) > 1e-8) problems.push(`${tag}：汇率 ${e.rate} 跟这次游玩的 ${r} 不一致`);
+        const want = Math.max(bu, roundTo(e.orig_cents * r, bu));
+        if (want !== e.cents) problems.push(`${tag}：按汇率应折合 ${want / 100}，存的是 ${e.cents / 100}`);
+      }
+    }
+    try {
+      const re = splitExpense(e.orig_cents, e.cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })), ou, bu);
+      const stored = new Map(sh.map((x) => [x.member_id, x]));
+      for (const x of re) {
+        const y = stored.get(x.memberId);
+        if (y.cents !== x.cents || y.orig_cents !== x.origCents) { problems.push(`${tag}：成员 #${x.memberId} 分摊应为 ${x.cents / 100}（原币 ${x.origCents / 100}），存的是 ${y.cents / 100}（${y.orig_cents / 100}）`); break; }
+      }
+    } catch (err) { problems.push(`${tag}：没法重算分摊（${err.message}）`); }
+    byTrip.get(e.trip_id).expenses.push({ payerId: e.payer_id, cents: e.cents, shares: sh.map((x) => ({ memberId: x.member_id, cents: x.cents })) });
+  }
+  for (const p of pays) {
+    if (p.cents % unitOf(tripById.get(p.trip_id).base)) problems.push(`${where(tripById.get(p.trip_id))} 转账 #${p.id}：金额不是整数单位`);
+    byTrip.get(p.trip_id).payments.push({ fromId: p.from_id, toId: p.to_id, cents: p.cents });
+  }
+  for (const t of trips) {
+    const d = byTrip.get(t.id);
+    const { balances, transfers } = settle(d.members, d.expenses, d.payments);
+    const sum = balances.reduce((a, b) => a + b.net, 0);
+    if (sum !== 0) problems.push(`${where(t)}：所有人的净额加起来不是 0（差 ${sum / 100}）`);
+    const unsettled = balances.reduce((a, b) => a + (b.net > 0 ? b.net : 0), 0);
+    if (transfers.reduce((a, x) => a + x.cents, 0) !== unsettled) problems.push(`${where(t)}：建议转账总额跟未结清金额对不上`);
+  }
+  let missing = 0;
+  for (const f of files) if (!fs.existsSync(path.join(UPLOADS, f.file))) missing++;
+  if (missing) problems.push(`有 ${missing} 个图片文件在磁盘上找不到`);
+  return { ok: problems.length === 0, problems, counts: { trips: trips.length, expenses: exps.length, payments: pays.length, files: files.length }, at: new Date().toISOString() };
+}
+// 最近一次备份（由 deploy/backup.sh 生成）
+function latestBackup() {
+  try {
+    const f = fs.readdirSync(BACKUPS).filter((n) => /^aa-\d{8}-\d{4}\.sql\.gz$/.test(n)).sort().pop();
+    if (!f) return null;
+    const st = fs.statSync(path.join(BACKUPS, f));
+    return { file: f, at: st.mtime.toISOString(), bytes: st.size, ageHours: Math.round((Date.now() - st.mtimeMs) / 36e5 * 10) / 10 };
+  } catch { return null; }
+}
+let lastCheck = null;
+route('GET', '/api/admin/health', async () => {
+  if (!lastCheck || Date.now() - Date.parse(lastCheck.at) > 60 * 1000) lastCheck = await verifyData();
+  return { check: { ...lastCheck, problems: lastCheck.problems.slice(0, 30) }, backup: latestBackup() };
+}, { auth: 'admin' });
+// 下载最新的数据库备份（管理员偶尔下载一份存到自己电脑 / 网盘，防止服务器整个坏掉）
+route('GET', '/api/admin/backup/latest', async () => {
+  const b = latestBackup();
+  if (!b) throw new HttpError(404, '还没有备份');
+  return { __file: { name: b.file, data: fs.readFileSync(path.join(BACKUPS, b.file)), type: 'application/gzip' } };
 }, { auth: 'admin' });
 
 // 跨游玩统计（按年）。各次游玩的结算币种可能不同，统一折算成人民币
@@ -864,15 +1039,15 @@ route('GET', '/api/admin/stats', async ({ query }) => {
   const from = `${year}-01-01`, to = `${year + 1}-01-01`;
   const [{ rows: trips }, { rows: exps }, { rows: shares }, { rows: mems }, { rows: rates }, { rows: years }] = await Promise.all([
     db.query(`SELECT id, name, to_char(start_day,'YYYY-MM-DD') AS "startDay", base_currency AS base,
-      (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members FROM trips t WHERE start_day >= $1 AND start_day < $2 ORDER BY start_day`, [from, to]),
+      (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members FROM trips t WHERE start_day >= $1 AND start_day < $2 AND deleted_at IS NULL ORDER BY start_day`, [from, to]),
     db.query(`SELECT e.trip_id, e.category, e.cents, m.person_id FROM expenses e JOIN trips t ON t.id=e.trip_id JOIN members m ON m.id=e.payer_id
-      WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+      WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
     db.query(`SELECT e.trip_id, s.cents, m.person_id FROM expense_shares s JOIN expenses e ON e.id=s.expense_id JOIN trips t ON t.id=e.trip_id
-      JOIN members m ON m.id=s.member_id WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+      JOIN members m ON m.id=s.member_id WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
     db.query(`SELECT m.trip_id, p.id AS person_id, p.name FROM members m JOIN people p ON p.id=m.person_id JOIN trips t ON t.id=m.trip_id
-      WHERE t.start_day >= $1 AND t.start_day < $2`, [from, to]),
+      WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
     db.query(`SELECT trip_id, currency, rate::float AS rate FROM trip_rates`),
-    db.query(`SELECT DISTINCT extract(year FROM start_day)::int AS y FROM trips ORDER BY 1 DESC`),
+    db.query(`SELECT DISTINCT extract(year FROM start_day)::int AS y FROM trips WHERE deleted_at IS NULL ORDER BY 1 DESC`),
   ]);
   const live = await liveRates();
   const factor = new Map(trips.map((t) => [t.id, toCnyFactor(t.base, rates.filter((r) => r.trip_id === t.id), live)]));
@@ -982,6 +1157,8 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     if (e instanceof HttpError) return send(e.status, { error: e.message });
     console.error(e);
+    // 数据库的金额校验触发器拦下了不平的账（说明代码有 bug），整笔已回滚，没有存进去
+    if (/aa_invariant/.test(e.message)) return send(500, { error: '数据校验没通过，这次修改没有保存。请截图告诉管理员' });
     send(500, { error: '服务器出错了' });
   }
 });
@@ -989,6 +1166,7 @@ const server = http.createServer(async (req, res) => {
 setInterval(() => {
   db.query(`DELETE FROM sessions WHERE expires_at < now()`).catch(() => {});
   db.query(`DELETE FROM login_fails WHERE first_at < now() - interval '1 day'`).catch(() => {});
+  purgeTrash().catch((e) => console.error('purgeTrash', e));
 }, 3600 * 1000).unref();
 
 async function main() {
@@ -1006,13 +1184,22 @@ async function main() {
   }
   // 命令行：node server.js clean-uploads —— 删除数据库里已经没有引用的图片文件
   if (process.argv[2] === 'clean-uploads') {
-    const { rows } = await db.query(`SELECT file FROM images UNION SELECT file FROM pay_codes`);
+    const { rows } = await db.query(`SELECT file FROM images UNION SELECT file FROM pay_codes UNION SELECT unnest(files) FROM trash`);
     const used = new Set(rows.map((r) => r.file));
     const orphans = fs.readdirSync(UPLOADS).filter((f) => !used.has(f));
     for (const f of orphans) if (/^[a-f0-9]{32}\.(jpg|png|webp)$/.test(f)) fs.unlinkSync(path.join(UPLOADS, f));
     console.log(`清理了 ${orphans.length} 个没用的文件`);
     await db.end();
     return;
+  }
+  // 命令行：node server.js check —— 全量数据校验，有问题时打印出来并以 1 退出
+  if (process.argv[2] === 'check') {
+    const r = await verifyData();
+    console.log(`数据校验：${r.counts.trips} 次游玩、${r.counts.expenses} 笔账、${r.counts.payments} 笔转账、${r.counts.files} 个图片文件`);
+    for (const x of r.problems) console.log('  ✗ ' + x);
+    console.log(r.ok ? '全部正确' : `发现 ${r.problems.length} 个问题`);
+    await db.end();
+    process.exit(r.ok ? 0 : 1);
   }
   fs.mkdirSync(UPLOADS, { recursive: true });
   server.listen(PORT, HOST, () => console.log(`aa listening on ${HOST}:${PORT}`));

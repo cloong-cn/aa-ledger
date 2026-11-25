@@ -5,6 +5,7 @@ sudo -u aa psql -q -d aa -f tests/cleanup.sql >/dev/null 2>&1
 sudo -u aa node server.js create-admin zzadmin test-admin-1 >/dev/null
 node tests/unit.test.js; u=$?
 node tests/api.test.mjs; rc=$?
+sudo -u aa UPLOADS=/srv/aa/uploads node server.js check || rc=$((rc + 1))   # 全量数据校验（包括测试数据）
 sudo -u aa psql -q -d aa -f tests/cleanup.sql >/dev/null 2>&1
 sudo -u aa UPLOADS=/srv/aa/uploads node server.js clean-uploads >/dev/null
 exit $((u + rc))
