@@ -1,0 +1,1069 @@
+'use strict';
+// AA 账本前端：无框架。/ = 管理员首页，/t/<key> = 某次游玩（凭分享链接）
+const $app = document.getElementById('app');
+const { computeShares } = window.AASettle;
+
+const CATS = [
+  { key: 'food', name: '餐饮', icon: '🍜' },
+  { key: 'transport', name: '交通', icon: '🚗' },
+  { key: 'lodging', name: '住宿', icon: '🏨' },
+  { key: 'ticket', name: '门票', icon: '🎫' },
+  { key: 'fun', name: '娱乐', icon: '🎤' },
+  { key: 'shopping', name: '购物', icon: '🛍️' },
+  { key: 'other', name: '其他', icon: '📦' },
+];
+const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
+const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
+
+// ---------- 工具 ----------
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function money(c, { sign = false, cur = true } = {}) {
+  const neg = c < 0; const a = Math.abs(c);
+  const s = (a / 100).toFixed(a % 100 === 0 ? 0 : 2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? '¥' : '') + s;
+}
+const amountInput = (c) => (c / 100).toFixed(c % 100 === 0 ? 0 : 2);
+const md = (day) => `${Number(day.slice(5, 7))}月${Number(day.slice(8))}日`;
+const wk = (day) => '周' + WEEK[new Date(day + 'T00:00:00Z').getUTCDay()];
+function addDays(day, n) { const d = new Date(day + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+const daysBetween = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000);
+function range(t) {
+  if (!t.endDay || t.endDay === t.startDay) return `${t.startDay.slice(0, 4)}年${md(t.startDay)}`;
+  return `${md(t.startDay)} – ${t.endDay.slice(0, 4) !== t.startDay.slice(0, 4) ? t.endDay.slice(0, 4) + '年' : ''}${md(t.endDay)}`;
+}
+const fmtTime = (ts) => new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
+};
+
+function toast(msg, err = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { t.className = err ? 'err' : ''; }, err ? 3200 : 1800);
+}
+
+async function api(method, url, body, { raw = false } = {}) {
+  const headers = {};
+  if (S.trip && S.me) headers['X-Actor'] = String(S.me);
+  let payload;
+  if (raw) { payload = body; headers['Content-Type'] = body.type; }
+  else if (body !== undefined) { payload = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
+  let res;
+  try { res = await fetch(url, { method, headers, body: payload, credentials: 'same-origin' }); }
+  catch { throw new Error('网络不通，请稍后再试'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(data.error || `出错了（${res.status}）`); e.status = res.status; throw e; }
+  return data;
+}
+
+// ---------- 弹层 ----------
+const $sheet = document.getElementById('sheet');
+const $back = document.getElementById('sheet-backdrop');
+function openSheet(html, onMount) {
+  $sheet.innerHTML = `<div class="grab"></div>${html}`;
+  $sheet.hidden = false; $back.hidden = false;
+  document.body.style.overflow = 'hidden';
+  $sheet.scrollTop = 0;
+  onMount && onMount($sheet);
+}
+function closeSheet() {
+  $sheet.hidden = true; $back.hidden = true; $sheet.innerHTML = '';
+  document.body.style.overflow = '';
+}
+$back.addEventListener('click', closeSheet);
+const sheetHead = (title) => `<div class="sh-head"><h3>${esc(title)}</h3><button class="icon-btn" data-close aria-label="关闭">✕</button></div>`;
+$sheet.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) closeSheet(); });
+
+function confirmSheet(title, text, okText = '确定', danger = false) {
+  return new Promise((resolve) => {
+    openSheet(`${sheetHead(title)}<p class="muted" style="margin-top:-4px">${text}</p>
+      <div class="btns" style="margin-top:16px"><button class="btn" data-no>取消</button><button class="btn ${danger ? 'danger' : 'primary'}" data-yes>${esc(okText)}</button></div>`, (el) => {
+      el.querySelector('[data-no]').onclick = () => { closeSheet(); resolve(false); };
+      el.querySelector('[data-yes]').onclick = () => { closeSheet(); resolve(true); };
+      el.querySelector('[data-close]').onclick = () => { closeSheet(); resolve(false); };
+    });
+  });
+}
+
+const $viewer = document.getElementById('viewer');
+function viewImage(src) {
+  $viewer.innerHTML = `<img src="${esc(src)}" alt="图片"><button class="icon-btn close" aria-label="关闭">✕</button>`;
+  $viewer.hidden = false;
+}
+$viewer.addEventListener('click', () => { $viewer.hidden = true; $viewer.innerHTML = ''; });
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!$viewer.hidden) { $viewer.hidden = true; return; }
+  if (!$sheet.hidden) closeSheet();
+});
+
+// 图片压缩：长截图保留清晰度（宽 ≤1200、高 ≤2800），转成 JPEG
+async function compressImage(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const s = Math.min(1, 1200 / w, 2800 / h);
+    if (s === 1 && file.size < 900 * 1024 && /^image\/(jpeg|png|webp)$/.test(file.type)) return file;
+    const c = document.createElement('canvas');
+    c.width = Math.round(w * s); c.height = Math.round(h * s);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    return await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+  } catch { throw new Error('这张图片读不出来，换一张试试'); }
+  finally { URL.revokeObjectURL(url); }
+}
+function pickFiles(multiple = true) {
+  return new Promise((resolve) => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = multiple;
+    inp.onchange = () => resolve([...inp.files]);
+    inp.click();
+  });
+}
+
+// ---------- 状态与路由 ----------
+const S = { me: null, admin: null, today: null, trip: null, key: null, tab: 'bills', adminTab: 'trips', statYear: null };
+
+function go(path, replace = false) {
+  history[replace ? 'replaceState' : 'pushState'](null, '', path);
+  route();
+}
+window.addEventListener('popstate', () => { closeSheet(); route(); });
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-link]');
+  if (a) { e.preventDefault(); go(a.getAttribute('href')); }
+});
+
+async function route() {
+  const m = location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,32})\/?$/);
+  try {
+    const meRes = await api('GET', '/api/me');
+    S.admin = meRes.admin; S.today = meRes.today;
+  } catch (e) { $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">📡</div>${esc(e.message)}</div></div>`; return; }
+  if (m) {
+    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; }
+    return loadTrip(true);
+  }
+  S.trip = null; S.key = null;
+  if (!S.admin) return renderLogin();
+  return renderAdmin();
+}
+
+// ---------- 登录 ----------
+function renderLogin() {
+  document.title = 'AA 账本';
+  $app.innerHTML = `<div class="login">
+    <div class="logo">AA</div>
+    <h1>AA 账本</h1>
+    <p class="muted" style="margin:0 0 22px">出去玩花的钱，记下来，自动算谁该给谁多少。<br>朋友请直接打开群里分享的链接，不用登录。</p>
+    <form id="lf">
+      <div class="field"><label for="lu">管理员账号</label><input class="input" id="lu" name="username" autocomplete="username" required></div>
+      <div class="field"><label for="lp">密码</label><input class="input" id="lp" name="password" type="password" autocomplete="current-password" required></div>
+      <div class="err" id="le"></div>
+      <button class="btn primary block">登录</button>
+    </form></div>`;
+  document.getElementById('lf').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    try { await api('POST', '/api/login', { username: f.get('username'), password: f.get('password') }); route(); }
+    catch (err) { document.getElementById('le').textContent = err.message; }
+  };
+}
+
+// ======================================================================
+// 管理员首页
+// ======================================================================
+async function renderAdmin() {
+  document.title = 'AA 账本';
+  $app.innerHTML = `<div class="wrap">
+    <div class="top"><h1>AA 账本</h1>
+      <button class="btn primary small" id="new-trip">＋ 新建游玩</button>
+      <button class="icon-btn" id="admin-menu" aria-label="菜单">⋯</button></div>
+    <div class="seg"><button data-at="trips" class="${S.adminTab === 'trips' ? 'on' : ''}">游玩</button><button data-at="stats" class="${S.adminTab === 'stats' ? 'on' : ''}">年度统计</button></div>
+    <div id="admin-body"><div class="empty">加载中…</div></div></div>`;
+  $app.querySelectorAll('[data-at]').forEach((b) => b.onclick = () => { S.adminTab = b.dataset.at; renderAdmin(); });
+  document.getElementById('new-trip').onclick = newTripSheet;
+  document.getElementById('admin-menu').onclick = adminMenu;
+  const body = document.getElementById('admin-body');
+  try {
+    if (S.adminTab === 'trips') body.innerHTML = tripListHtml((await api('GET', '/api/admin/trips')).trips);
+    else body.innerHTML = adminStatsHtml(await api('GET', '/api/admin/stats' + (S.statYear ? `?year=${S.statYear}` : '')));
+  } catch (e) { body.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  body.querySelectorAll('[data-year]').forEach((b) => b.onclick = () => { S.statYear = Number(b.dataset.year); renderAdmin(); });
+  bindBars(body);
+}
+
+function tripListHtml(trips) {
+  if (!trips.length) return `<div class="empty"><div class="e">🏕️</div>还没有游玩记录<br><span class="small">点右上角「新建游玩」开始，然后把链接发到群里</span></div>`;
+  let html = '', lastMonth = '';
+  for (const t of trips) {
+    const mon = t.startDay.slice(0, 7);
+    if (mon !== lastMonth) { html += `<div class="section-title"><span>${mon.slice(0, 4)} 年 ${Number(mon.slice(5))} 月</span></div>`; lastMonth = mon; }
+    const status = t.locked ? '<span class="tag">已锁定</span>'
+      : t.unsettled > 0 ? `<span class="tag warn">待结清 ${money(t.unsettled)}</span>`
+      : t.count ? '<span class="tag good">已结清</span>' : '<span class="tag">还没记账</span>';
+    html += `<a class="trip" href="/t/${esc(t.key)}" data-link>
+      <div class="r1"><b>${esc(t.name)}</b><span class="amt num">${money(t.total)}</span></div>
+      <div class="r2"><span>${range(t)} · ${t.members} 人 · ${t.count} 笔</span>${status}</div></a>`;
+  }
+  return html;
+}
+
+function adminStatsHtml(d) {
+  const total = d.trips.reduce((a, t) => a + t.total, 0);
+  const years = d.years.length ? d.years : [d.year];
+  let html = `<div class="chips" style="margin-bottom:12px">${years.map((y) => `<button class="chip ${y === d.year ? 'on' : ''}" data-year="${y}">${y}</button>`).join('')}</div>`;
+  if (!d.trips.length) return html + `<div class="empty">${d.year} 年还没有游玩</div>`;
+  const avg = Math.round(total / d.trips.length);
+  html += `<div class="tiles">
+    <div class="tile"><div class="l">出去玩了</div><div class="v num">${d.trips.length}<small> 次</small></div></div>
+    <div class="tile"><div class="l">一共花了</div><div class="v num">${money(total)}</div></div>
+    <div class="tile"><div class="l">平均每次</div><div class="v num">${money(avg)}</div></div>
+    <div class="tile"><div class="l">一起玩过的人</div><div class="v num">${d.people.length}<small> 人</small></div></div></div>`;
+  // 每月
+  const months = Array.from({ length: 12 }, (_, i) => d.months.find((m) => m.m === i + 1) || { m: i + 1, cents: 0, trips: 0 });
+  html += `<div class="card"><h2>每月花费<span class="sp"></span><small>按出发月份</small></h2>${vbars(months.map((m) => ({ label: `${m.m}月`, short: String(m.m), v: m.cents, tip: `${m.m}月 · ${m.trips} 次 · ${money(m.cents)}` })))}</div>`;
+  // 类别
+  html += `<div class="card"><h2>花在哪了</h2>${catBars(d.categories.map((c) => ({ key: c.category, cents: c.cents })), total)}</div>`;
+  // 每人
+  const maxP = Math.max(1, ...d.people.map((p) => Math.max(p.paid, p.share)));
+  html += `<div class="card"><h2>每个人</h2><div class="legend"><span><i></i>垫付</span><span><i class="b2"></i>应摊（自己花的）</span></div>
+    ${d.people.map((p) => `<div class="hbar" title="${esc(p.name)}：参加 ${p.trips} 次，垫付 ${money(p.paid)}，应摊 ${money(p.share)}">
+      <div class="lab"><span>${esc(p.name)} <span class="faint small">${p.trips} 次</span></span><span class="num">垫付 ${money(p.paid)} · 应摊 ${money(p.share)}</span></div>
+      <div class="track"><div class="fill" style="width:${(p.paid / maxP) * 100}%"></div></div>
+      <div class="track"><div class="fill b2" style="width:${(p.share / maxP) * 100}%"></div></div></div>`).join('')}</div>`;
+  // 每次
+  html += `<div class="card"><h2>每次游玩</h2>${d.trips.slice().reverse().map((t) => `<div class="kv"><span>${md(t.startDay)} ${esc(t.name)}</span><span class="num">${money(t.total)} <span class="faint">· ${t.members} 人</span></span></div>`).join('')}</div>`;
+  return html;
+}
+
+function adminMenu() {
+  openSheet(`${sheetHead('管理员')}
+    <div class="list">
+      <button class="item" id="am-pw"><span class="cat">🔑</span><span class="main"><span class="t">修改密码</span></span></button>
+      <button class="item" id="am-out"><span class="cat">↩︎</span><span class="main"><span class="t">退出登录</span><span class="s">${esc(S.admin.username)}</span></span></button>
+    </div>`, (el) => {
+    el.querySelector('#am-out').onclick = async () => { await api('POST', '/api/logout').catch(() => {}); closeSheet(); route(); };
+    el.querySelector('#am-pw').onclick = () => openSheet(`${sheetHead('修改密码')}
+      <form id="pwf"><div class="field"><label>原密码</label><input class="input" type="password" name="old" autocomplete="current-password" required></div>
+      <div class="field"><label>新密码（至少 6 位）</label><input class="input" type="password" name="new" autocomplete="new-password" minlength="6" required></div>
+      <div class="err"></div><button class="btn primary block">保存</button></form>`, (el2) => {
+      el2.querySelector('form').onsubmit = async (e) => {
+        e.preventDefault(); const f = new FormData(e.target);
+        try { await api('POST', '/api/password', { old: f.get('old'), new: f.get('new') }); closeSheet(); toast('密码已修改'); }
+        catch (err) { el2.querySelector('.err').textContent = err.message; }
+      };
+    });
+  });
+}
+
+async function newTripSheet() {
+  let known = [];
+  try { known = (await api('GET', '/api/admin/people')).people; } catch {}
+  const picked = new Set();
+  openSheet(`${sheetHead('新建游玩')}
+    <form id="ntf">
+      <div class="field"><label>去哪玩 / 叫什么</label><input class="input" name="name" maxlength="40" placeholder="例如：周末千岛湖" required></div>
+      <div class="row2">
+        <div class="field"><label>开始</label><input class="input" type="date" name="startDay" value="${S.today}" required></div>
+        <div class="field"><label>结束（可空）</label><input class="input" type="date" name="endDay"></div>
+      </div>
+      <div class="field"><div class="lab"><span>谁一起去</span><span class="faint">之后也能随时加人</span></div>
+        <div class="chips" id="nt-people"></div>
+        <div class="row2" style="margin-top:8px"><input class="input" id="nt-name" maxlength="20" placeholder="输入名字，回车添加"><button type="button" class="btn" id="nt-add" style="flex:none">添加</button></div>
+      </div>
+      <div class="err"></div>
+      <button class="btn primary block">创建并打开</button>
+    </form>`, (el) => {
+    const box = el.querySelector('#nt-people');
+    const names = [...known];
+    const draw = () => { box.innerHTML = names.map((n) => `<button type="button" class="chip ${picked.has(n) ? 'on' : ''}" data-n="${esc(n)}">${esc(n)}</button>`).join('') || '<span class="faint small">还没有人，下面输入名字添加</span>'; };
+    draw();
+    box.onclick = (e) => { const b = e.target.closest('[data-n]'); if (!b) return; const n = b.dataset.n; picked.has(n) ? picked.delete(n) : picked.add(n); draw(); };
+    const inp = el.querySelector('#nt-name');
+    const add = () => { const n = inp.value.trim().slice(0, 20); if (!n) return; if (!names.includes(n)) names.unshift(n); picked.add(n); inp.value = ''; draw(); inp.focus(); };
+    el.querySelector('#nt-add').onclick = add;
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
+    el.querySelector('form').onsubmit = async (e) => {
+      e.preventDefault();
+      if (inp.value.trim()) add();
+      const f = new FormData(e.target);
+      try {
+        const r = await api('POST', '/api/admin/trips', { name: f.get('name'), startDay: f.get('startDay'), endDay: f.get('endDay') || null, members: [...picked] });
+        closeSheet(); go(`/t/${r.key}`);
+        setTimeout(() => shareLink(true), 400);
+      } catch (err) { el.querySelector('.err').textContent = err.message; }
+    };
+  });
+}
+
+// ======================================================================
+// 游玩页
+// ======================================================================
+async function loadTrip(first = false) {
+  try {
+    S.trip = await api('GET', `/api/t/${S.key}`);
+  } catch (e) {
+    $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">🔗</div>${esc(e.message)}${S.admin ? '<br><br><a href="/" data-link>返回首页</a>' : ''}</div></div>`;
+    return;
+  }
+  const saved = Number(store.get('aa:me:' + S.key));
+  S.me = S.trip.members.some((m) => m.id === saved) ? saved : null;
+  renderTrip();
+  if (first && !S.me && !store.get('aa:skip:' + S.key)) whoAmISheet();
+}
+const T = () => S.trip;
+const member = (id) => T().members.find((m) => m.id === id);
+const nameOf = (id) => member(id)?.name ?? '已移除';
+const editable = () => !T().trip.locked;
+const balOf = (id) => T().balances.find((b) => b.memberId === id) || { paid: 0, share: 0, sent: 0, received: 0, net: 0 };
+
+async function refresh() { await loadTrip(false); }
+async function act(fn, okMsg) {
+  try { const r = await fn(); if (okMsg) toast(okMsg); await refresh(); return r; }
+  catch (e) { toast(e.message, true); if (e.status === 423 || e.status === 404) await refresh(); throw e; }
+}
+
+function renderTrip() {
+  const d = T(), t = d.trip;
+  document.title = `${t.name} · AA 账本`;
+  const total = d.expenses.reduce((a, e) => a + e.cents, 0);
+  const me = S.me && member(S.me);
+  let mine = '';
+  if (me) {
+    const b = balOf(me.id);
+    mine = `<div><span class="label">我花的（应摊）</span><b class="num">${money(b.share)}</b></div>
+      <div><span class="label">${b.net > 0 ? '还应收回' : b.net < 0 ? '还要付出' : '我的账'}</span><b class="num">${b.net === 0 ? '已结清' : money(Math.abs(b.net))}</b></div>`;
+  } else {
+    mine = `<div><span class="label">笔数</span><b class="num">${d.expenses.length}</b></div><div><span class="label">待转账</span><b class="num">${d.transfers.length} 笔</b></div>`;
+  }
+  const tabs = [['bills', '🧾', '账单'], ['settle', '💸', '结算'], ['stats', '📊', '统计'], ['people', '👥', '成员']];
+  $app.innerHTML = `<div class="wrap">
+    <div class="top">
+      ${S.admin ? '<a class="icon-btn" href="/" data-link aria-label="返回">‹</a>' : ''}
+      <h1>${esc(t.name)}</h1>
+      <button class="chip-me" id="whoami">${me ? `我是 <b>${esc(me.name)}</b>` : '我是谁？'} ▾</button>
+    </div>
+    <div class="hero">
+      <div class="label">一共花了</div>
+      <div class="big num">${money(total)}</div>
+      <div class="meta">${range(t)} · ${d.members.length} 人</div>
+      <div class="row">${mine}</div>
+    </div>
+    ${t.locked ? `<div class="banner lock">🔒<span class="sp">账单已锁定${t.lockedAt ? '（' + fmtTime(t.lockedAt) + '）' : ''}，只能查看${S.admin ? '' : '。需要改的话请找管理员解锁'}</span></div>` : ''}
+    <div id="tab-body"></div>
+  </div>
+  ${editable() && S.tab === 'bills' ? '<button class="fab" id="fab">＋ 记一笔</button>' : ''}
+  <nav class="tabbar"><div class="in">${tabs.map(([k, i, n]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}"><span class="i">${i}</span>${n}</button>`).join('')}</div></nav>`;
+  document.getElementById('whoami').onclick = whoAmISheet;
+  const fab = document.getElementById('fab');
+  if (fab) fab.onclick = () => expenseForm(null);
+  $app.querySelectorAll('[data-tab]').forEach((b) => b.onclick = () => { S.tab = b.dataset.tab; renderTrip(); window.scrollTo(0, 0); });
+  const body = document.getElementById('tab-body');
+  ({ bills: renderBills, settle: renderSettle, stats: renderStats, people: renderPeople })[S.tab](body);
+}
+
+// ---------- 我是谁 ----------
+function whoAmISheet() {
+  const d = T();
+  openSheet(`${sheetHead('你是谁？')}
+    <p class="muted small" style="margin-top:-6px">选一下，记账时默认是你付的钱，也方便大家看到是谁记的。只保存在这台手机上。</p>
+    <div class="chips" id="who-list">${d.members.map((m) => `<button class="chip ${m.id === S.me ? 'on' : ''}" data-id="${m.id}">${esc(m.name)}</button>`).join('')}</div>
+    ${editable() ? `<div class="field" style="margin-top:16px"><label>名单里没有我</label>
+      <div class="row2"><input class="input" id="who-new" maxlength="20" placeholder="输入你的名字"><button class="btn primary" id="who-add" style="flex:none">加入</button></div></div>` : ''}
+    <button class="btn ghost block" id="who-skip" style="margin-top:6px">先随便看看</button>`, (el) => {
+    el.querySelector('#who-list').onclick = (e) => {
+      const b = e.target.closest('[data-id]'); if (!b) return;
+      S.me = Number(b.dataset.id); store.set('aa:me:' + S.key, String(S.me));
+      closeSheet(); renderTrip();
+    };
+    el.querySelector('#who-skip').onclick = () => { store.set('aa:skip:' + S.key, '1'); closeSheet(); };
+    const add = el.querySelector('#who-add');
+    if (add) add.onclick = async () => {
+      const name = el.querySelector('#who-new').value.trim();
+      if (!name) return;
+      try {
+        const r = await api('POST', `/api/t/${S.key}/members`, { name });
+        S.me = r.id; store.set('aa:me:' + S.key, String(r.id));
+        closeSheet(); toast(`欢迎，${name}`); await refresh();
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ---------- 账单 ----------
+function renderBills(body) {
+  const d = T();
+  if (!d.expenses.length) {
+    body.innerHTML = `<div class="empty"><div class="e">🧾</div>还没有账目<br><span class="small">谁付了钱，就点右下角「记一笔」</span></div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const e of d.expenses) { if (!groups.has(e.day)) groups.set(e.day, []); groups.get(e.day).push(e); }
+  let html = '';
+  for (const [day, list] of groups) {
+    const sum = list.reduce((a, e) => a + e.cents, 0);
+    html += `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
+    for (const e of list) {
+      const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
+      const sub = `${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
+      html += `<button class="item" data-exp="${e.id}"><span class="cat">${CAT[e.category]?.icon || '📦'}</span>
+        <span class="main"><span class="t">${esc(e.title || CAT[e.category]?.name || '其他')}</span><span class="s">${sub}</span></span>
+        <span class="amt"><b class="num">${money(e.cents)}</b>${mineShare ? `<span class="num">我 ${money(mineShare.cents)}</span>` : S.me ? '<span>我不参与</span>' : ''}</span></button>`;
+    }
+    html += '</div>';
+  }
+  body.innerHTML = html;
+  body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
+}
+
+function expenseDetail(id) {
+  const e = T().expenses.find((x) => x.id === id);
+  if (!e) return;
+  const imgs = e.images.map((i) => `<button class="thumb" data-img="${i}"><img src="/api/t/${S.key}/images/${i}" alt="截图" loading="lazy"></button>`).join('');
+  const mode = e.shares.some((s) => s.fixed != null) ? '含指定金额' : e.shares.every((s) => s.weight === e.shares[0].weight) ? '平均分' : '按份数';
+  openSheet(`${sheetHead(e.title || CAT[e.category].name)}
+    <div style="font-size:32px;font-weight:700;margin:-6px 0 10px" class="num">${money(e.cents)}</div>
+    <div class="card">
+      <div class="kv"><span>类别</span><span>${CAT[e.category]?.icon} ${CAT[e.category]?.name}</span></div>
+      <div class="kv"><span>日期</span><span>${md(e.day)} ${wk(e.day)}</span></div>
+      <div class="kv"><span>谁付的</span><span><b>${esc(nameOf(e.payerId))}</b></span></div>
+      <div class="kv"><span>怎么分</span><span>${e.shares.length} 人 · ${mode}</span></div>
+    </div>
+    <div class="card"><h2>每人分摊</h2>
+      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${money(s.cents)}</span></div>`).join('')}
+    </div>
+    ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
+    ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
+    <p class="faint tiny" style="margin:14px 2px">${esc(e.createdBy || '未署名')} 记于 ${fmtTime(e.createdAt)}${e.updatedAt && new Date(e.updatedAt) - new Date(e.createdAt) > 2000 ? ` · 修改于 ${fmtTime(e.updatedAt)}` : ''}</p>
+    ${editable() ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>` : ''}`, (el) => {
+    el.querySelectorAll('[data-img]').forEach((b) => b.onclick = () => viewImage(`/api/t/${S.key}/images/${b.dataset.img}`));
+    const del = el.querySelector('#ed-del');
+    if (del) del.onclick = async () => {
+      if (!(await confirmSheet('删除这笔账？', `${esc(e.title || CAT[e.category].name)} ${money(e.cents)}，连同截图一起删除。操作记录里会留下记录。`, '删除', true))) return expenseDetail(id);
+      await act(() => api('DELETE', `/api/t/${S.key}/expenses/${id}`), '已删除').catch(() => {});
+    };
+    const ed = el.querySelector('#ed-edit');
+    if (ed) ed.onclick = () => expenseForm(e);
+  });
+}
+
+// 记一笔 / 修改
+function expenseForm(exp) {
+  const d = T();
+  if (!d.members.length) { toast('先在「成员」里加人', true); S.tab = 'people'; return renderTrip(); }
+  const f = {
+    amount: exp ? amountInput(exp.cents) : '',
+    title: exp?.title || '', note: exp?.note || '',
+    category: exp?.category || 'food',
+    payerId: exp?.payerId ?? S.me ?? d.members[0].id,
+    day: exp?.day || (d.trip.endDay && S.today > d.trip.endDay ? d.trip.startDay : S.today < d.trip.startDay ? d.trip.startDay : S.today),
+    parts: new Map(), // memberId -> {weight, fixed(string|'')}
+    detail: false,
+  };
+  if (exp) {
+    for (const s of exp.shares) f.parts.set(s.memberId, { weight: s.fixed != null ? 1 : s.weight, fixed: s.fixed != null ? amountInput(s.fixed) : '' });
+    f.detail = exp.shares.some((s) => s.fixed != null || s.weight !== (member(s.memberId)?.weight ?? 1));
+  } else {
+    for (const m of d.members) f.parts.set(m.id, { weight: m.weight, fixed: '' });
+  }
+  const newFiles = []; // 待上传
+  let saving = false;
+
+  openSheet(`${sheetHead(exp ? '修改这笔' : '记一笔')}
+    <div class="field amount-wrap"><input class="amount-input num" id="f-amount" inputmode="decimal" placeholder="0" value="${esc(f.amount)}" autocomplete="off"></div>
+    <div class="field"><input class="input" id="f-title" maxlength="40" placeholder="花在什么上？例如：晚饭火锅" value="${esc(f.title)}"></div>
+    <div class="field"><div class="lab">类别</div><div class="chips" id="f-cat"></div></div>
+    <div class="field"><div class="lab">谁付的钱</div><div class="chips" id="f-payer"></div></div>
+    <div class="field"><div class="lab"><span>谁参与 AA</span><span><button type="button" class="btn ghost small" id="f-all">全选</button><button type="button" class="btn ghost small" id="f-detail"></button></span></div>
+      <div class="chips" id="f-who"></div>
+      <div id="f-split" style="margin-top:10px"></div>
+      <div class="preview num" id="f-preview"></div>
+    </div>
+    <div class="field"><label for="f-day">日期</label><input class="input" type="date" id="f-day" value="${f.day}"></div>
+    <div class="field"><label for="f-note">备注</label><textarea class="input" id="f-note" maxlength="500" placeholder="可选，例如：含服务费；小明没吃辣锅">${esc(f.note)}</textarea></div>
+    <div class="field"><div class="lab"><span>截图 / 小票</span><span class="faint">最多 9 张</span></div><div class="thumbs" id="f-imgs"></div></div>
+    <div class="err" id="f-err"></div>
+    <button class="btn primary block" id="f-save">${exp ? '保存修改' : '记下来'}</button>`, (el) => {
+    const $ = (s) => el.querySelector(s);
+    const drawCats = () => { $('#f-cat').innerHTML = CATS.map((c) => `<button type="button" class="chip ${f.category === c.key ? 'on' : ''}" data-c="${c.key}">${c.icon} ${c.name}</button>`).join(''); };
+    const drawPayer = () => { $('#f-payer').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.payerId === m.id ? 'on' : ''}" data-p="${m.id}">${esc(m.name)}</button>`).join(''); };
+    const drawWho = () => {
+      $('#f-who').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.parts.has(m.id) ? 'on' : ''}" data-w="${m.id}">${esc(m.name)}${m.weight !== 1 ? ` ×${m.weight}` : ''}</button>`).join('');
+      $('#f-all').textContent = f.parts.size === d.members.length ? '全不选' : '全选';
+      $('#f-detail').textContent = f.detail ? '收起细调' : '按份数 / 指定金额';
+      drawSplit();
+    };
+    const drawSplit = () => {
+      const box = $('#f-split');
+      if (!f.detail) { box.innerHTML = ''; return preview(); }
+      box.innerHTML = f.parts.size ? `<div class="split-rows">${d.members.filter((m) => f.parts.has(m.id)).map((m) => {
+        const p = f.parts.get(m.id);
+        return `<div class="split-row" data-row="${m.id}"><span class="n">${esc(m.name)}</span>
+          <input data-k="weight" inputmode="decimal" value="${esc(p.weight)}" aria-label="${esc(m.name)}的份数" ${p.fixed !== '' ? 'disabled' : ''}><span class="faint small">份</span>
+          <input class="money" data-k="fixed" inputmode="decimal" placeholder="或金额" value="${esc(p.fixed)}" aria-label="${esc(m.name)}的指定金额">
+          <span class="r num" data-r></span></div>`;
+      }).join('')}</div><p class="faint tiny" style="margin:6px 2px 0">填了金额的人按金额算，剩下的钱按份数分给其他人</p>` : '';
+      preview();
+    };
+    const calc = () => {
+      const cents = parseCents($('#f-amount').value);
+      if (!cents || !f.parts.size) return { cents, shares: null };
+      const parts = [];
+      for (const [memberId, p] of f.parts) {
+        if (f.detail && String(p.fixed).trim() !== '') {
+          const fx = parseCents(p.fixed, true);
+          if (fx == null) return { cents, error: `${nameOf(memberId)} 的金额不对` };
+          parts.push({ memberId, weight: 0, fixed: fx });
+        } else {
+          const w = Number(p.weight);
+          if (!(w > 0 && w < 100)) return { cents, error: `${nameOf(memberId)} 的份数要大于 0` };
+          parts.push({ memberId, weight: w, fixed: null });
+        }
+      }
+      try { return { cents, parts, shares: computeShares(cents, parts) }; }
+      catch (e) { return { cents, error: e.message }; }
+    };
+    const preview = () => {
+      const r = calc();
+      const pv = $('#f-preview');
+      el.querySelectorAll('[data-r]').forEach((x) => { x.textContent = ''; });
+      if (r.error) { pv.innerHTML = `<span class="neg">${esc(r.error)}</span>`; return; }
+      if (!r.shares) { pv.textContent = f.parts.size ? '' : '至少选一个人'; return; }
+      if (f.detail) {
+        for (const s of r.shares) { const x = el.querySelector(`[data-row="${s.memberId}"] [data-r]`); if (x) x.textContent = money(s.cents); }
+        pv.textContent = '';
+      } else {
+        const same = r.shares.every((s) => s.cents === r.shares[0].cents);
+        pv.textContent = same ? `${r.shares.length} 人平分，每人 ${money(r.shares[0].cents)}` : r.shares.map((s) => `${nameOf(s.memberId)} ${money(s.cents)}`).join(' · ');
+      }
+    };
+    const drawImgs = () => {
+      const old = exp ? (T().expenses.find((x) => x.id === exp.id)?.images || []) : [];
+      const urls = newFiles.map((fl) => fl.url);
+      const n = old.length + newFiles.length;
+      $('#f-imgs').innerHTML = old.map((i) => `<div class="thumb"><img src="/api/t/${S.key}/images/${i}" alt="截图" data-view="/api/t/${S.key}/images/${i}"><button type="button" class="del" data-delimg="${i}" aria-label="删除图片">✕</button></div>`).join('')
+        + urls.map((u, i) => `<div class="thumb"><img src="${u}" alt="待上传" data-view="${u}"><button type="button" class="del" data-delnew="${i}" aria-label="移除">✕</button></div>`).join('')
+        + (n < 9 ? '<button type="button" class="thumb add" id="f-addimg" aria-label="添加图片">＋</button>' : '');
+    };
+    drawCats(); drawPayer(); drawWho(); drawImgs();
+
+    $('#f-amount').oninput = preview;
+    $('#f-cat').onclick = (e) => { const b = e.target.closest('[data-c]'); if (b) { f.category = b.dataset.c; drawCats(); } };
+    $('#f-payer').onclick = (e) => { const b = e.target.closest('[data-p]'); if (b) { f.payerId = Number(b.dataset.p); drawPayer(); } };
+    $('#f-who').onclick = (e) => {
+      const b = e.target.closest('[data-w]'); if (!b) return;
+      const id = Number(b.dataset.w);
+      if (f.parts.has(id)) f.parts.delete(id); else f.parts.set(id, { weight: member(id).weight, fixed: '' });
+      drawWho();
+    };
+    $('#f-all').onclick = () => {
+      if (f.parts.size === d.members.length) f.parts.clear();
+      else for (const m of d.members) if (!f.parts.has(m.id)) f.parts.set(m.id, { weight: m.weight, fixed: '' });
+      drawWho();
+    };
+    $('#f-detail').onclick = () => { f.detail = !f.detail; drawWho(); };
+    $('#f-split').oninput = (e) => {
+      const row = e.target.closest('[data-row]'); if (!row) return;
+      const p = f.parts.get(Number(row.dataset.row));
+      p[e.target.dataset.k] = e.target.value;
+      if (e.target.dataset.k === 'fixed') row.querySelector('[data-k="weight"]').disabled = e.target.value.trim() !== '';
+      preview();
+    };
+    $('#f-imgs').onclick = async (e) => {
+      const v = e.target.closest('[data-view]');
+      if (v) return viewImage(v.dataset.view);
+      const dn = e.target.closest('[data-delnew]');
+      if (dn) { const [x] = newFiles.splice(Number(dn.dataset.delnew), 1); URL.revokeObjectURL(x.url); return drawImgs(); }
+      const di = e.target.closest('[data-delimg]');
+      if (di) {
+        if (!confirm('删除这张图片？')) return;
+        try { await api('DELETE', `/api/t/${S.key}/images/${di.dataset.delimg}`); await refresh(); drawImgs(); toast('图片已删除'); }
+        catch (err) { toast(err.message, true); }
+        return;
+      }
+      if (e.target.closest('#f-addimg')) {
+        const files = await pickFiles(true);
+        const room = 9 - (exp ? (T().expenses.find((x) => x.id === exp.id)?.images.length || 0) : 0) - newFiles.length;
+        for (const file of files.slice(0, room)) {
+          try { const blob = await compressImage(file); newFiles.push({ blob, url: URL.createObjectURL(blob) }); }
+          catch (err) { toast(err.message, true); }
+        }
+        if (files.length > room) toast(`最多 9 张，多出的 ${files.length - room} 张没加`, true);
+        drawImgs();
+      }
+    };
+    $('#f-save').onclick = async () => {
+      if (saving) return;
+      const r = calc();
+      const err = $('#f-err');
+      if (!r.cents) { err.textContent = '请输入金额'; return $('#f-amount').focus(); }
+      if (!f.parts.size) { err.textContent = '至少选一个人参与 AA'; return; }
+      if (r.error) { err.textContent = r.error; return; }
+      saving = true; $('#f-save').disabled = true; $('#f-save').textContent = '保存中…';
+      const payload = {
+        amount: $('#f-amount').value.trim(), title: $('#f-title').value, note: $('#f-note').value,
+        category: f.category, payerId: f.payerId, day: $('#f-day').value,
+        shares: r.parts.map((p) => ({ memberId: p.memberId, weight: p.fixed != null ? 1 : p.weight, fixed: p.fixed != null ? amountInput(p.fixed) : null })),
+      };
+      try {
+        const res = exp ? await api('PUT', `/api/t/${S.key}/expenses/${exp.id}`, payload) : await api('POST', `/api/t/${S.key}/expenses`, payload);
+        let failed = 0;
+        for (let i = 0; i < newFiles.length; i++) {
+          $('#f-save').textContent = `上传图片 ${i + 1}/${newFiles.length}…`;
+          try { await api('POST', `/api/t/${S.key}/expenses/${res.id}/images`, newFiles[i].blob, { raw: true }); }
+          catch (e2) { failed++; console.warn(e2); }
+        }
+        newFiles.forEach((x) => URL.revokeObjectURL(x.url));
+        closeSheet();
+        toast(failed ? `已保存，但有 ${failed} 张图片没传上去` : exp ? '已修改' : '记好了', !!failed);
+        S.tab = 'bills';
+        await refresh();
+      } catch (e2) {
+        err.textContent = e2.message; saving = false;
+        $('#f-save').disabled = false; $('#f-save').textContent = exp ? '保存修改' : '记下来';
+        if (e2.status === 423) { closeSheet(); await refresh(); }
+      }
+    };
+    if (!exp) setTimeout(() => $('#f-amount').focus(), 250);
+  });
+}
+function parseCents(v, allowZero = false) {
+  const s = String(v ?? '').trim();
+  if (!/^\d{1,7}(\.\d{1,2})?$/.test(s)) return null;
+  const [i, fr = ''] = s.split('.');
+  const c = Number(i) * 100 + Number((fr + '00').slice(0, 2));
+  return c === 0 && !allowZero ? null : c;
+}
+
+// ---------- 结算 ----------
+function renderSettle(body) {
+  const d = T();
+  if (!d.expenses.length) { body.innerHTML = `<div class="empty"><div class="e">💸</div>还没有账目，记了账之后这里会算出谁该转给谁</div>`; return; }
+  let html = '';
+  if (d.transfers.length) {
+    html += `<div class="card" style="padding:16px 0 4px"><h2 style="padding:0 16px">还需要转账<span class="sp"></span><small>最少 ${d.transfers.length} 笔就能结清</small></h2>
+      ${d.transfers.map((x, i) => {
+        const to = member(x.toId);
+        const hasCode = to && (to.codes.wechat || to.codes.alipay);
+        const mine = S.me && (x.fromId === S.me || x.toId === S.me);
+        return `<div class="xfer ${mine ? 'me' : ''}"><div class="who"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
+          <div class="acts">${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
+      }).join('')}</div>`;
+  } else {
+    html += `<div class="card done-big"><div class="e">🎉</div><b>已全部结清</b><span class="muted small">没有人欠钱了</span>
+      ${editable() ? '<div style="margin-top:12px"><button class="btn primary" id="lock">锁定账单</button></div>' : ''}</div>`;
+  }
+  // 每人
+  html += `<div class="card"><h2>每人明细</h2><table class="bal-table num"><thead><tr><th>成员</th><th>垫付</th><th>应摊</th><th>结果</th></tr></thead><tbody>
+    ${d.balances.filter((b) => member(b.memberId)).map((b) => {
+      const diff = b.paid - b.share;
+      const state = b.net > 0 ? `<span class="pos">应收 ${money(b.net)}</span>` : b.net < 0 ? `<span class="neg">应付 ${money(-b.net)}</span>` : diff !== 0 ? '<span class="muted">已结清</span>' : '<span class="muted">—</span>';
+      return `<tr><td>${esc(nameOf(b.memberId))}${b.memberId === S.me ? ' <span class="tag ink">我</span>' : ''}</td><td>${money(b.paid)}</td><td>${money(b.share)}</td><td>${state}</td></tr>`;
+    }).join('')}</tbody></table>
+    <p class="faint tiny" style="margin:10px 0 0">垫付 = 替大家付的钱；应摊 = 自己该承担的部分；结果已扣除下面「已转账」的金额</p></div>`;
+  if (d.payments.length) {
+    html += `<div class="card"><h2>已转账</h2>${d.payments.slice().reverse().map((p) => `<div class="kv"><span>✓ ${esc(nameOf(p.fromId))} → ${esc(nameOf(p.toId))} <span class="faint tiny">${fmtTime(p.createdAt)}</span></span>
+      <span class="num">${money(p.cents)}${editable() ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
+  }
+  html += `<div class="btns" style="margin-top:4px"><button class="btn" id="poster">🖼️ 生成结算长图</button>${editable() && d.transfers.length ? '<button class="btn" id="lock">🔒 锁定账单</button>' : ''}</div>`;
+  body.innerHTML = html;
+  body.querySelectorAll('[data-code]').forEach((b) => b.onclick = () => showCodes(Number(b.dataset.code)));
+  body.querySelectorAll('[data-paid]').forEach((b) => b.onclick = () => paidSheet(d.transfers[Number(b.dataset.paid)]));
+  body.querySelectorAll('[data-undo]').forEach((b) => b.onclick = async () => {
+    if (!(await confirmSheet('撤销这条转账？', '撤销后这笔钱会重新算作没转。', '撤销', true))) return;
+    act(() => api('DELETE', `/api/t/${S.key}/payments/${b.dataset.undo}`), '已撤销').catch(() => {});
+  });
+  body.querySelector('#poster').onclick = posterSheet;
+  body.querySelectorAll('#lock').forEach((b) => b.onclick = lockTrip);
+}
+
+function paidSheet(x) {
+  openSheet(`${sheetHead('标记已转账')}
+    <p style="margin-top:-4px"><b>${esc(nameOf(x.fromId))}</b> 已经转给 <b>${esc(nameOf(x.toId))}</b></p>
+    <div class="field amount-wrap"><input class="amount-input num" id="pd-amt" inputmode="decimal" value="${amountInput(x.cents)}"></div>
+    <p class="faint small">只转了一部分也可以改金额。</p>
+    <div class="err"></div>
+    <button class="btn primary block" id="pd-ok">确认已转</button>`, (el) => {
+    el.querySelector('#pd-ok').onclick = async () => {
+      try {
+        await api('POST', `/api/t/${S.key}/payments`, { fromId: x.fromId, toId: x.toId, amount: el.querySelector('#pd-amt').value.trim() });
+        closeSheet(); toast('已标记');
+        await refresh();
+        if (!T().transfers.length && editable()) {
+          if (await confirmSheet('全部结清了 🎉', '要现在锁定账单吗？锁定后所有人都不能再修改，需要改时管理员可以解锁。', '锁定')) lockTrip(true);
+        }
+      } catch (e) { el.querySelector('.err').textContent = e.message; }
+    };
+  });
+}
+
+async function lockTrip(skipConfirm = false) {
+  const left = T().transfers.length;
+  if (skipConfirm !== true && !(await confirmSheet('锁定账单？', left ? `还有 ${left} 笔转账没标记完成。锁定后所有人都不能再记账或修改，只有管理员能解锁。` : '锁定后所有人都不能再记账或修改，只有管理员能解锁。', '锁定'))) return;
+  act(() => api('POST', `/api/t/${S.key}/lock`), '已锁定').catch(() => {});
+}
+
+function showCodes(memberId) {
+  const m = member(memberId);
+  const kinds = [['wechat', '微信'], ['alipay', '支付宝']].filter(([k]) => m.codes[k]);
+  let cur = kinds[0][0];
+  const draw = (el) => {
+    el.querySelector('#code-body').innerHTML = `<img src="/api/t/${S.key}/paycode/${m.id}/${cur}?v=${m.codes[cur]}" alt="${esc(m.name)}的收款码">
+      <p class="faint small">长按图片可识别二维码或保存</p>`;
+    el.querySelectorAll('[data-k]').forEach((b) => b.classList.toggle('on', b.dataset.k === cur));
+  };
+  openSheet(`${sheetHead(`${m.name} 的收款码`)}
+    ${kinds.length > 1 ? `<div class="seg">${kinds.map(([k, n]) => `<button data-k="${k}">${n}</button>`).join('')}</div>` : ''}
+    <div class="code-box" id="code-body"></div>`, (el) => {
+    draw(el);
+    el.querySelectorAll('[data-k]').forEach((b) => b.onclick = () => { cur = b.dataset.k; draw(el); });
+  });
+}
+
+// ---------- 结算长图 ----------
+function posterSheet() {
+  openSheet(`${sheetHead('结算长图')}<div class="code-box" id="pos-box"><p class="muted">生成中…</p></div>`, async (el) => {
+    try {
+      const canvas = drawPoster();
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+      const url = URL.createObjectURL(blob);
+      const fname = `${T().trip.name}-结算.png`;
+      const canShare = navigator.canShare && navigator.canShare({ files: [new File([blob], fname, { type: 'image/png' })] });
+      el.querySelector('#pos-box').innerHTML = `<img src="${url}" alt="结算长图" style="max-height:none;box-shadow:var(--shadow)">
+        <p class="faint small">手机上长按图片可以保存或直接发给朋友</p>
+        <div class="btns"><a class="btn" href="${url}" download="${esc(fname)}">下载图片</a>${canShare ? '<button class="btn primary" id="pos-share">分享</button>' : ''}</div>`;
+      const sh = el.querySelector('#pos-share');
+      if (sh) sh.onclick = () => navigator.share({ files: [new File([blob], fname, { type: 'image/png' })], title: fname }).catch(() => {});
+    } catch (e) { el.querySelector('#pos-box').innerHTML = `<p class="neg">${esc(e.message)}</p>`; }
+  });
+}
+
+function drawPoster() {
+  const d = T(), t = d.trip;
+  const W = 390, P = 22, scale = 3;
+  const FONT = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif';
+  const C = { bg: '#f4f4f1', card: '#ffffff', text: '#1c1c1a', muted: '#6f6e69', faint: '#a3a29c', line: '#e8e7e2', ink: '#1f1f22', good: '#16794c', bad: '#cf3f36' };
+  const total = d.expenses.reduce((a, e) => a + e.cents, 0);
+  const rows = d.balances.filter((b) => member(b.memberId));
+  const cats = CATS.map((c) => ({ ...c, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents > 0).sort((a, b) => b.cents - a.cents);
+  // 先算高度
+  const H = 22 + 128 + 18 + (44 + rows.length * 34 + 12) + 18
+    + (44 + Math.max(1, d.transfers.length) * 34 + (d.payments.length ? 30 + d.payments.length * 26 : 0) + 12) + 18
+    + (cats.length ? 44 + Math.ceil(cats.length / 2) * 28 + 12 + 18 : 0) + 40;
+  const c = document.createElement('canvas');
+  c.width = W * scale; c.height = H * scale;
+  const g = c.getContext('2d');
+  g.scale(scale, scale);
+  g.fillStyle = C.bg; g.fillRect(0, 0, W, H);
+  const font = (size, weight = 400) => { g.font = `${weight} ${size}px ${FONT}`; };
+  const text = (s, x, y, { size = 14, weight = 400, color = C.text, align = 'left', max } = {}) => {
+    font(size, weight); g.fillStyle = color; g.textAlign = align; g.textBaseline = 'alphabetic';
+    let str = String(s);
+    if (max) while (g.measureText(str).width > max && str.length > 1) str = str.slice(0, -2) + '…';
+    g.fillText(str, x, y);
+  };
+  const rr = (x, y, w, h, r, fill) => { g.beginPath(); g.roundRect(x, y, w, h, r); g.fillStyle = fill; g.fill(); };
+  let y = 22;
+  // 头部
+  const grad = g.createLinearGradient(0, y, W, y + 128);
+  grad.addColorStop(0, '#1f1f22'); grad.addColorStop(1, '#2b2b30');
+  rr(P - 6, y, W - 2 * (P - 6), 128, 18, grad);
+  text(t.name, P + 10, y + 32, { size: 18, weight: 700, color: '#fff', max: W - 2 * P - 20 });
+  text(`${range(t)} · ${d.members.length} 人 · ${d.expenses.length} 笔`, P + 10, y + 54, { size: 12.5, color: 'rgba(255,255,255,.65)' });
+  text('一共花了', P + 10, y + 82, { size: 12, color: 'rgba(255,255,255,.65)' });
+  text(money(total), P + 10, y + 112, { size: 28, weight: 700, color: '#fff' });
+  const perHead = rows.filter((b) => b.share > 0).length;
+  if (perHead) {
+    text('人均', W - P - 10, y + 82, { size: 12, color: 'rgba(255,255,255,.65)', align: 'right' });
+    text(money(Math.round(total / perHead)), W - P - 10, y + 112, { size: 20, weight: 600, color: '#fff', align: 'right' });
+  }
+  y += 128 + 18;
+  // 每人明细
+  const cardTop = (h, title) => { rr(P - 6, y, W - 2 * (P - 6), h, 16, C.card); text(title, P + 8, y + 28, { size: 15, weight: 600 }); };
+  let h = 44 + rows.length * 34 + 12;
+  cardTop(h, '每人明细');
+  const col = [W - P - 8 - 170, W - P - 8 - 95, W - P - 8];
+  text('垫付', col[0], y + 28, { size: 11.5, color: C.muted, align: 'right' });
+  text('应摊', col[1], y + 28, { size: 11.5, color: C.muted, align: 'right' });
+  text('差额', col[2], y + 28, { size: 11.5, color: C.muted, align: 'right' });
+  let ry = y + 44;
+  for (const b of rows) {
+    g.fillStyle = C.line; g.fillRect(P + 8, ry, W - 2 * P - 16, 1);
+    const diff = b.paid - b.share;
+    text(nameOf(b.memberId), P + 8, ry + 22, { size: 14, weight: 500, max: col[0] - P - 70 });
+    text(money(b.paid), col[0], ry + 22, { size: 13.5, align: 'right' });
+    text(money(b.share), col[1], ry + 22, { size: 13.5, align: 'right' });
+    text(diff === 0 ? '0' : money(diff, { sign: true }), col[2], ry + 22, { size: 13.5, weight: 600, align: 'right', color: diff > 0 ? C.good : diff < 0 ? C.bad : C.muted });
+    ry += 34;
+  }
+  y += h + 18;
+  // 转账
+  h = 44 + Math.max(1, d.transfers.length) * 34 + (d.payments.length ? 30 + d.payments.length * 26 : 0) + 12;
+  cardTop(h, d.transfers.length ? `转账方案（${d.transfers.length} 笔）` : '转账方案');
+  ry = y + 44;
+  if (!d.transfers.length) { text('🎉 已全部结清', P + 8, ry + 22, { size: 14, color: C.good, weight: 600 }); ry += 34; }
+  for (const x of d.transfers) {
+    g.fillStyle = C.line; g.fillRect(P + 8, ry, W - 2 * P - 16, 1);
+    text(`${nameOf(x.fromId)}  →  ${nameOf(x.toId)}`, P + 8, ry + 22, { size: 14, weight: 500, max: W - 2 * P - 120 });
+    text(money(x.cents), W - P - 8, ry + 22, { size: 15, weight: 700, align: 'right' });
+    ry += 34;
+  }
+  if (d.payments.length) {
+    text('已转账', P + 8, ry + 22, { size: 12, color: C.muted }); ry += 30;
+    for (const p of d.payments) {
+      text(`✓ ${nameOf(p.fromId)} → ${nameOf(p.toId)}`, P + 8, ry + 16, { size: 13, color: C.muted, max: W - 2 * P - 120 });
+      text(money(p.cents), W - P - 8, ry + 16, { size: 13, color: C.muted, align: 'right' });
+      ry += 26;
+    }
+  }
+  y += h + 18;
+  // 类别
+  if (cats.length) {
+    h = 44 + Math.ceil(cats.length / 2) * 28 + 12;
+    cardTop(h, '花在哪了');
+    cats.forEach((ct, i) => {
+      const cx = i % 2 ? W / 2 + 4 : P + 8, cy = y + 44 + Math.floor(i / 2) * 28 + 18;
+      text(`${ct.icon} ${ct.name}`, cx, cy, { size: 13.5 });
+      text(money(ct.cents), cx + (W / 2 - P - 16), cy, { size: 13.5, weight: 600, align: 'right' });
+    });
+    y += h + 18;
+  }
+  text(`AA 账本 · 生成于 ${fmtTime(Date.now())}`, W / 2, y + 12, { size: 11.5, color: C.faint, align: 'center' });
+  return c;
+}
+
+// ---------- 统计 ----------
+function vbars(items) {
+  const max = Math.max(1, ...items.map((i) => i.v));
+  return `<div class="vbars">${items.map((i) => `<div class="col" title="${esc(i.tip)}" tabindex="0"><span class="tip num">${money(i.v)}</span><div class="b" style="height:${i.v ? Math.max(2, (i.v / max) * 100) : 0}%"></div></div>`).join('')}</div>
+    <div class="vlabels">${items.map((i) => `<span>${esc(i.short ?? i.label)}</span>`).join('')}</div>`;
+}
+function catBars(list, total) {
+  if (!list.length) return '<p class="muted small">没有数据</p>';
+  const max = Math.max(1, ...list.map((c) => c.cents));
+  return list.map((c) => {
+    const ct = CAT[c.key] || CAT.other;
+    return `<div class="hbar" title="${ct.name}：${money(c.cents)}（${Math.round((c.cents / total) * 100)}%）"><div class="lab"><span>${ct.icon} ${ct.name}</span><span class="num">${money(c.cents)} · ${Math.round((c.cents / total) * 100)}%</span></div>
+      <div class="track"><div class="fill" style="width:${(c.cents / max) * 100}%"></div></div></div>`;
+  }).join('');
+}
+function bindBars(root) {
+  // 触屏上点一下柱子显示数值
+  root.querySelectorAll('.vbars .col').forEach((col) => col.onclick = () => {
+    const on = col.classList.contains('on');
+    col.parentElement.querySelectorAll('.col').forEach((x) => x.classList.remove('on'));
+    if (!on) col.classList.add('on');
+  });
+}
+
+function renderStats(body) {
+  const d = T();
+  if (!d.expenses.length) { body.innerHTML = `<div class="empty"><div class="e">📊</div>记了账之后这里会有统计</div>`; return; }
+  const total = d.expenses.reduce((a, e) => a + e.cents, 0);
+  const days = [...new Set(d.expenses.map((e) => e.day))].sort();
+  const first = days[0], last = days[days.length - 1];
+  const span = daysBetween(first, last) + 1;
+  const sharers = d.balances.filter((b) => b.share > 0).length || 1;
+  let html = `<div class="tiles">
+    <div class="tile"><div class="l">总花费</div><div class="v num">${money(total)}</div></div>
+    <div class="tile"><div class="l">人均</div><div class="v num">${money(Math.round(total / sharers))}</div></div>
+    <div class="tile"><div class="l">笔数</div><div class="v num">${d.expenses.length}<small> 笔</small></div></div>
+    <div class="tile"><div class="l">${span > 1 ? `${span} 天，日均` : '天数'}</div><div class="v num">${span > 1 ? money(Math.round(total / span)) : '1<small> 天</small>'}</div></div></div>`;
+
+  // 每人：垫付 vs 应摊
+  const rows = d.balances.filter((b) => member(b.memberId)).sort((a, b) => b.share - a.share);
+  const maxP = Math.max(1, ...rows.map((b) => Math.max(b.paid, b.share)));
+  html += `<div class="card"><h2>每个人</h2><div class="legend"><span><i></i>垫付</span><span><i class="b2"></i>应摊（自己花的）</span></div>
+    ${rows.map((b) => `<div class="hbar" title="${esc(nameOf(b.memberId))}：垫付 ${money(b.paid)}，应摊 ${money(b.share)}，占总花费 ${Math.round((b.share / total) * 100)}%">
+      <div class="lab"><span>${esc(nameOf(b.memberId))}${b.memberId === S.me ? ' <span class="tag ink">我</span>' : ''}</span><span class="num">垫付 ${money(b.paid)} · 应摊 ${money(b.share)}</span></div>
+      <div class="track"><div class="fill" style="width:${(b.paid / maxP) * 100}%"></div></div>
+      <div class="track"><div class="fill b2" style="width:${(b.share / maxP) * 100}%"></div></div></div>`).join('')}</div>`;
+
+  // 类别
+  const cats = CATS.map((c) => ({ key: c.key, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents).sort((a, b) => b.cents - a.cents);
+  html += `<div class="card"><h2>花在哪了</h2>${catBars(cats, total)}</div>`;
+
+  // 每天
+  if (span > 1 && span <= 31) {
+    const items = [];
+    for (let i = 0; i < span; i++) {
+      const day = addDays(first, i);
+      const v = d.expenses.filter((e) => e.day === day).reduce((a, e) => a + e.cents, 0);
+      items.push({ label: md(day), short: span > 10 ? String(Number(day.slice(8))) : md(day), v, tip: `${md(day)} ${wk(day)}：${money(v)}` });
+    }
+    html += `<div class="card"><h2>每天花了多少</h2>${vbars(items)}</div>`;
+  }
+
+  // 最大的几笔
+  const top = d.expenses.slice().sort((a, b) => b.cents - a.cents).slice(0, 5);
+  html += `<div class="card"><h2>最大的 ${top.length} 笔</h2>${top.map((e) => `<div class="kv" data-exp="${e.id}" style="cursor:pointer"><span>${CAT[e.category]?.icon} ${esc(e.title || CAT[e.category]?.name)} <span class="faint tiny">${md(e.day)} · ${esc(nameOf(e.payerId))} 付</span></span><span class="num">${money(e.cents)}</span></div>`).join('')}</div>`;
+
+  // 谁垫钱最多
+  const payer = rows.slice().sort((a, b) => b.paid - a.paid)[0];
+  if (payer && payer.paid > 0) html += `<p class="muted small" style="text-align:center">💪 本次垫钱最多的是 <b>${esc(nameOf(payer.memberId))}</b>，替大家先付了 ${money(payer.paid)}</p>`;
+  body.innerHTML = html;
+  body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
+  bindBars(body);
+}
+
+// ---------- 成员 / 设置 ----------
+function renderPeople(body) {
+  const d = T(), t = d.trip;
+  const ed = editable();
+  let html = `<div class="list">${d.members.map((m) => {
+    const codes = [m.codes.wechat && '微信', m.codes.alipay && '支付宝'].filter(Boolean);
+    return `<div class="mem"><span class="avatar">${esc([...m.name][0])}</span>
+      <span class="main"><b>${esc(m.name)}</b>${m.id === S.me ? ' <span class="tag ink">我</span>' : ''}${m.weight !== 1 ? ` <span class="tag">${m.weight} 份</span>` : ''}
+        <div class="s">${codes.length ? `收款码：${codes.join('、')}` : '还没有收款码'}</div></span>
+      <button class="btn small" data-mem="${m.id}">${ed ? '设置' : '查看'}</button></div>`;
+  }).join('') || '<div class="empty small">还没有成员</div>'}</div>`;
+  if (ed) html += `<div class="row2" style="margin-top:10px"><input class="input" id="pm-new" maxlength="20" placeholder="临时加人：输入名字"><button class="btn primary" id="pm-add" style="flex:none">添加</button></div>`;
+
+  html += `<div class="section-title"><span>这次游玩</span></div>
+    <div class="list">
+      <button class="item" id="pm-share"><span class="cat">🔗</span><span class="main"><span class="t">分享链接</span><span class="s">发到群里，大家打开就能记账</span></span></button>
+      ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
+      <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔</span></span></button>
+      ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
+    </div>
+    ${t.note ? `<div class="section-title"><span>说明</span></div><div class="note-box">${esc(t.note)}</div>` : ''}`;
+  if (d.isAdmin) {
+    html += `<div class="section-title"><span>管理员</span></div><div class="list">
+      ${t.locked ? '<button class="item" id="pa-unlock"><span class="cat">🔓</span><span class="main"><span class="t">解锁账单</span><span class="s">解锁后大家可以继续修改</span></span></button>' : ''}
+      <button class="item" id="pa-rekey"><span class="cat">♻️</span><span class="main"><span class="t">重置分享链接</span><span class="s">旧链接立即失效，适合链接外泄时</span></span></button>
+      <button class="item" id="pa-del"><span class="cat">🗑️</span><span class="main"><span class="t" style="color:var(--danger)">删除这次游玩</span><span class="s">所有账目和截图都会删除，不能恢复</span></span></button></div>`;
+  }
+  body.innerHTML = html;
+  body.querySelectorAll('[data-mem]').forEach((b) => b.onclick = () => memberSheet(Number(b.dataset.mem)));
+  const add = body.querySelector('#pm-add');
+  if (add) {
+    const inp = body.querySelector('#pm-new');
+    const go2 = async () => {
+      const name = inp.value.trim(); if (!name) return;
+      await act(() => api('POST', `/api/t/${S.key}/members`, { name }), `已添加 ${name}`).catch(() => {});
+    };
+    add.onclick = go2;
+    inp.onkeydown = (e) => { if (e.key === 'Enter') go2(); };
+  }
+  body.querySelector('#pm-share').onclick = () => shareLink(false);
+  body.querySelector('#pm-log').onclick = logSheet;
+  const pe = body.querySelector('#pm-edit'); if (pe) pe.onclick = tripEditSheet;
+  const pl = body.querySelector('#pm-lock'); if (pl) pl.onclick = lockTrip;
+  const pu = body.querySelector('#pa-unlock');
+  if (pu) pu.onclick = () => act(() => api('POST', `/api/t/${S.key}/unlock`), '已解锁').catch(() => {});
+  const pr = body.querySelector('#pa-rekey');
+  if (pr) pr.onclick = async () => {
+    if (!(await confirmSheet('重置分享链接？', '旧链接会立即失效，已经打开过的朋友需要你重新发新链接。', '重置', true))) return;
+    try { const r = await api('POST', `/api/admin/trips/${t.id}/rekey`); S.key = r.key; history.replaceState(null, '', `/t/${r.key}`); await refresh(); shareLink(true); }
+    catch (e) { toast(e.message, true); }
+  };
+  const pd = body.querySelector('#pa-del');
+  if (pd) pd.onclick = async () => {
+    if (!(await confirmSheet(`删除「${esc(t.name)}」？`, `${d.expenses.length} 笔账目、所有截图和操作记录都会被删除，<b>不能恢复</b>。`, '永久删除', true))) return;
+    try { await api('DELETE', `/api/admin/trips/${t.id}`); toast('已删除'); go('/'); }
+    catch (e) { toast(e.message, true); }
+  };
+}
+
+function shareLink(fresh) {
+  const url = `${location.origin}/t/${S.key}`;
+  const text = `「${T().trip.name}」AA 记账：${url}`;
+  openSheet(`${sheetHead(fresh ? '把链接发到群里' : '分享链接')}
+    <p class="muted small" style="margin-top:-4px">拿到链接的人都能查看和记账，不用注册。只发给一起玩的朋友。</p>
+    <div class="note-box" style="word-break:break-all;user-select:all">${esc(url)}</div>
+    <div class="btns" style="margin-top:12px"><button class="btn primary" id="sl-copy">复制链接</button>${navigator.share ? '<button class="btn" id="sl-share">分享…</button>' : ''}</div>`, (el) => {
+    el.querySelector('#sl-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(text); toast('已复制，去群里粘贴吧'); }
+      catch { toast('复制失败，请长按上面的链接手动复制', true); }
+    };
+    const sh = el.querySelector('#sl-share');
+    if (sh) sh.onclick = () => navigator.share({ title: T().trip.name, text: `「${T().trip.name}」AA 记账`, url }).catch(() => {});
+  });
+}
+
+function tripEditSheet() {
+  const t = T().trip;
+  openSheet(`${sheetHead('游玩信息')}
+    <form id="te"><div class="field"><label>名称</label><input class="input" name="name" maxlength="40" value="${esc(t.name)}" required></div>
+    <div class="row2"><div class="field"><label>开始</label><input class="input" type="date" name="startDay" value="${t.startDay}" required></div>
+      <div class="field"><label>结束（可空）</label><input class="input" type="date" name="endDay" value="${t.endDay || ''}"></div></div>
+    <div class="field"><label>说明（可选）</label><textarea class="input" name="note" maxlength="500" placeholder="例如：住宿按房间分；油费大家平摊">${esc(t.note)}</textarea></div>
+    <div class="err"></div><button class="btn primary block">保存</button></form>`, (el) => {
+    el.querySelector('form').onsubmit = async (e) => {
+      e.preventDefault(); const f = new FormData(e.target);
+      try {
+        await api('PATCH', `/api/t/${S.key}`, { name: f.get('name'), startDay: f.get('startDay'), endDay: f.get('endDay') || null, note: f.get('note') });
+        closeSheet(); toast('已保存'); await refresh();
+      } catch (err) { el.querySelector('.err').textContent = err.message; }
+    };
+  });
+}
+
+function memberSheet(id) {
+  const m = member(id); if (!m) return;
+  const ed = editable();
+  const b = balOf(id);
+  const codeRow = (k, n) => `<div class="kv" style="align-items:center"><span>${n}收款码</span><span>
+    ${m.codes[k] ? `<button class="btn small" data-view="${k}">查看</button>` : '<span class="faint small">未上传</span>'}
+    ${ed ? `<button class="btn small" data-up="${k}">${m.codes[k] ? '更换' : '上传'}</button>${m.codes[k] ? `<button class="btn small danger" data-rm="${k}">删除</button>` : ''}` : ''}</span></div>`;
+  openSheet(`${sheetHead(m.name)}
+    <div class="card">
+      <div class="kv"><span>垫付</span><span class="num">${money(b.paid)}</span></div>
+      <div class="kv"><span>应摊</span><span class="num">${money(b.share)}</span></div>
+      <div class="kv"><span>结果</span><span class="num">${b.net > 0 ? `<span class="pos">应收 ${money(b.net)}</span>` : b.net < 0 ? `<span class="neg">应付 ${money(-b.net)}</span>` : '已结清'}</span></div>
+    </div>
+    <div class="card">${codeRow('wechat', '微信')}${codeRow('alipay', '支付宝')}
+      <p class="faint tiny" style="margin:8px 0 0">收款码跟着人走，以后的游玩也能直接用</p></div>
+    ${ed ? `<div class="card"><div class="field" style="margin:0"><label>默认份数（带家属可以填 2；记账时可以单独改）</label>
+      <div class="row2"><input class="input" id="ms-w" inputmode="decimal" value="${m.weight}"><button class="btn" id="ms-save" style="flex:none">保存</button></div></div></div>
+      <button class="btn danger block" id="ms-del">从这次游玩中移除</button>` : ''}
+    ${S.me !== id ? `<button class="btn ghost block" id="ms-me" style="margin-top:8px">这是我</button>` : ''}`, (el) => {
+    el.querySelectorAll('[data-view]').forEach((x) => x.onclick = () => viewImage(`/api/t/${S.key}/paycode/${id}/${x.dataset.view}?v=${m.codes[x.dataset.view]}`));
+    el.querySelectorAll('[data-up]').forEach((x) => x.onclick = async () => {
+      const [file] = await pickFiles(false); if (!file) return;
+      try {
+        const blob = await compressImage(file);
+        await api('PUT', `/api/t/${S.key}/paycode/${id}/${x.dataset.up}`, blob, { raw: true });
+        toast('收款码已保存'); await refresh(); memberSheet(id);
+      } catch (e) { toast(e.message, true); }
+    });
+    el.querySelectorAll('[data-rm]').forEach((x) => x.onclick = async () => {
+      if (!confirm('删除这个收款码？')) return;
+      try { await api('DELETE', `/api/t/${S.key}/paycode/${id}/${x.dataset.rm}`); toast('已删除'); await refresh(); memberSheet(id); }
+      catch (e) { toast(e.message, true); }
+    });
+    const sv = el.querySelector('#ms-save');
+    if (sv) sv.onclick = async () => {
+      try { await api('PATCH', `/api/t/${S.key}/members/${id}`, { weight: el.querySelector('#ms-w').value.trim() }); closeSheet(); toast('已保存'); await refresh(); }
+      catch (e) { toast(e.message, true); }
+    };
+    const del = el.querySelector('#ms-del');
+    if (del) del.onclick = async () => {
+      if (!(await confirmSheet(`移除 ${esc(m.name)}？`, '只有还没参与任何账目的人才能移除。', '移除', true))) return;
+      try {
+        await api('DELETE', `/api/t/${S.key}/members/${id}`);
+        if (S.me === id) { S.me = null; store.set('aa:me:' + S.key, null); }
+        toast('已移除'); await refresh();
+      } catch (e) { toast(e.message, true); }
+    };
+    const mm = el.querySelector('#ms-me');
+    if (mm) mm.onclick = () => { S.me = id; store.set('aa:me:' + S.key, String(id)); closeSheet(); renderTrip(); };
+  });
+}
+
+async function logSheet() {
+  openSheet(`${sheetHead('操作记录')}<div class="card" id="log-body"><p class="muted">加载中…</p></div>`, async (el) => {
+    try {
+      const { items } = await api('GET', `/api/t/${S.key}/log`);
+      el.querySelector('#log-body').innerHTML = items.length ? items.map((i) => `<div class="log-item"><b>${esc(i.actor)}</b> ${esc(i.detail)}<div class="when">${fmtTime(i.at)}</div></div>`).join('') : '<p class="muted">还没有记录</p>';
+    } catch (e) { el.querySelector('#log-body').innerHTML = `<p class="neg">${esc(e.message)}</p>`; }
+  });
+}
+
+route();

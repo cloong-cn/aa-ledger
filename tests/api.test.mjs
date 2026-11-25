@@ -1,0 +1,152 @@
+// 接口测试：对 http://127.0.0.1:8792 跑。需要先用 run.sh 建好 zzadmin
+const BASE = process.env.BASE || 'http://127.0.0.1:8792';
+let pass = 0, fail = 0;
+const ok = (name, cond, extra = '') => { cond ? pass++ : (fail++, console.log('✗', name, extra)); };
+let cookie = '';
+async function call(method, path, body, { actor, raw, type } = {}) {
+  const headers = {};
+  if (cookie) headers.Cookie = cookie;
+  if (actor) headers['X-Actor'] = String(actor);
+  let payload;
+  if (raw) { payload = raw; headers['Content-Type'] = type || 'image/png'; }
+  else if (body !== undefined) { payload = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
+  const res = await fetch(BASE + path, { method, headers, body: payload });
+  const sc = res.headers.get('set-cookie'); if (sc && sc.startsWith('aa_session=')) cookie = sc.split(';')[0];
+  const ct = res.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer());
+  return { status: res.status, data, ct };
+}
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+
+// 登录
+let r = await call('POST', '/api/login', { username: 'zzadmin', password: 'wrong' });
+ok('错误密码 401', r.status === 401);
+r = await call('POST', '/api/login', { username: 'zzadmin', password: 'test-admin-1' });
+ok('登录', r.status === 200 && cookie);
+r = await call('GET', '/api/me'); ok('me 是管理员', r.data.admin?.username === 'zzadmin');
+const adminCookie = cookie;
+
+// 创建游玩
+r = await call('POST', '/api/admin/trips', { name: 'zz测试千岛湖', startDay: '2026-11-20', endDay: '2026-11-22', members: ['zz甲', 'zz乙', 'zz丙'] });
+ok('创建游玩', r.status === 200 && r.data.key?.length === 22, JSON.stringify(r.data));
+let key = r.data.key; const tripId = r.data.id;
+r = await call('POST', '/api/admin/trips', { name: 'zz', startDay: '2026-11-20', endDay: '2026-11-01' });
+ok('结束早于开始被拒', r.status === 400);
+
+// 朋友（无 cookie）访问
+cookie = '';
+r = await call('GET', `/api/t/${key}`);
+ok('凭链接访问', r.status === 200 && r.data.members.length === 3 && !r.data.isAdmin);
+const [A, B, C] = r.data.members.map((m) => m.id);
+r = await call('GET', '/api/t/AAAAAAAAAAAAAAAAAAAAAA'); ok('错误链接 404', r.status === 404);
+r = await call('GET', '/api/admin/trips'); ok('非管理员不能列游玩', r.status === 401);
+
+// 临时加人
+r = await call('POST', `/api/t/${key}/members`, { name: 'zz丁' }, { actor: A });
+ok('加人', r.status === 200); const D = r.data.id;
+r = await call('POST', `/api/t/${key}/members`, { name: 'zz丁' }); ok('重复加人被拒', r.status === 400);
+r = await call('PATCH', `/api/t/${key}/members/${D}`, { weight: '2' }); ok('改份数', r.status === 200);
+
+// 记账：默认全员
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '100', title: '晚饭', category: 'food', payerId: A, day: '2026-11-20',
+  shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: A });
+ok('记账', r.status === 200); const E1 = r.data.id;
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '600', title: '民宿', category: 'lodging', payerId: B, day: '2026-11-20',
+  shares: [{ memberId: A, weight: 1 }, { memberId: B, weight: 1 }, { memberId: C, weight: 1 }, { memberId: D, weight: 2 }] }, { actor: B });
+ok('按份数记账', r.status === 200); const E2 = r.data.id;
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '90', title: '油费', category: 'transport', payerId: C, day: '2026-11-21',
+  shares: [{ memberId: A, fixed: '10' }, { memberId: B, weight: 1 }, { memberId: C, weight: 1 }] }, { actor: C });
+ok('指定金额记账', r.status === 200); const E3 = r.data.id;
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', payerId: A, shares: [{ memberId: A, fixed: '20' }] });
+ok('指定超额被拒', r.status === 400 && /超过/.test(r.data.error), JSON.stringify(r.data));
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '0', payerId: A, shares: [{ memberId: A }] }); ok('金额 0 被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '1.234', payerId: A, shares: [{ memberId: A }] }); ok('三位小数被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', payerId: 999999, shares: [{ memberId: A }] }); ok('外人付款被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', payerId: A, shares: [{ memberId: A }, { memberId: A }] }); ok('重复分摊被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', payerId: A, shares: [] }); ok('空分摊被拒', r.status === 400);
+
+r = await call('GET', `/api/t/${key}`);
+const e1 = r.data.expenses.find((e) => e.id === E1), e2 = r.data.expenses.find((e) => e.id === E2), e3 = r.data.expenses.find((e) => e.id === E3);
+ok('100 三人分 34/33/33', JSON.stringify(e1.shares.map((s) => s.cents)) === '[3334,3333,3333]', JSON.stringify(e1.shares));
+ok('600 按 1:1:1:2', JSON.stringify(e2.shares.map((s) => s.cents)) === '[12000,12000,12000,24000]');
+ok('90 指定10 其余平分', JSON.stringify(e3.shares.map((s) => s.cents)) === '[1000,4000,4000]');
+// 净额: A 付100 摊 33.34+120+10=163.34 -> -63.34; B 付600 摊 33.33+120+40=193.33 -> +406.67; C 付90 摊 33.33+120+40=193.33 -> -103.33; D 摊240 -> -240
+const net = Object.fromEntries(r.data.balances.map((b) => [b.memberId, b.net]));
+ok('净额正确', net[A] === -6334 && net[B] === 40667 && net[C] === -10333 && net[D] === -24000, JSON.stringify(net));
+ok('净额合计为 0', Object.values(net).reduce((a, b) => a + b, 0) === 0);
+ok('转账 3 笔都给 B', r.data.transfers.length === 3 && r.data.transfers.every((t) => t.toId === B), JSON.stringify(r.data.transfers));
+
+// 修改 & 不能移除有账的人
+r = await call('PUT', `/api/t/${key}/expenses/${E1}`, { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费',
+  shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: B });
+ok('修改账目', r.status === 200);
+r = await call('DELETE', `/api/t/${key}/members/${D}`); ok('有账的人不能移除', r.status === 400);
+r = await call('POST', `/api/t/${key}/members`, { name: 'zz戊' }); const Ex = r.data.id;
+r = await call('DELETE', `/api/t/${key}/members/${Ex}`); ok('无账的人能移除', r.status === 200);
+
+// 截图
+r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/png' });
+ok('上传图片', r.status === 200); const IMG = r.data.id;
+r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: Buffer.from('<svg></svg>'), type: 'image/png' });
+ok('伪造图片被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/svg+xml' });
+ok('svg 类型被拒', r.status === 415);
+r = await call('GET', `/api/t/${key}/images/${IMG}`);
+ok('读取图片', r.status === 200 && r.ct === 'image/png' && Buffer.compare(r.data, PNG) === 0);
+// 收款码
+r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png' }); ok('上传收款码', r.status === 200);
+r = await call('GET', `/api/t/${key}`); ok('收款码标记', !!r.data.members.find((m) => m.id === B).codes.wechat);
+r = await call('GET', `/api/t/${key}/paycode/${B}/wechat`); ok('读取收款码', r.status === 200 && r.ct === 'image/png');
+r = await call('GET', `/api/t/${key}/paycode/${A}/alipay`); ok('无收款码 404', r.status === 404);
+
+// 另一个游玩不能读这个游玩的图片
+cookie = adminCookie;
+r = await call('POST', '/api/admin/trips', { name: 'zz别的游玩', startDay: '2026-10-01', members: ['zz甲'] });
+const key2 = r.data.key; cookie = '';
+r = await call('GET', `/api/t/${key2}/images/${IMG}`); ok('跨游玩读图被拒', r.status === 404);
+r = await call('DELETE', `/api/t/${key2}/expenses/${E1}`); ok('跨游玩删账被拒', r.status === 404);
+
+// 转账
+r = await call('GET', `/api/t/${key}`);
+const t0 = r.data.transfers[0];
+r = await call('POST', `/api/t/${key}/payments`, { fromId: t0.fromId, toId: t0.toId, amount: (t0.cents / 100).toFixed(2) }, { actor: t0.fromId });
+ok('标记已转', r.status === 200); const P1 = r.data.id;
+r = await call('GET', `/api/t/${key}`); ok('转账后剩 2 笔', r.data.transfers.length === 2);
+r = await call('DELETE', `/api/t/${key}/payments/${P1}`); ok('撤销转账', r.status === 200);
+r = await call('GET', `/api/t/${key}`);
+for (const t of r.data.transfers) await call('POST', `/api/t/${key}/payments`, { fromId: t.fromId, toId: t.toId, amount: (t.cents / 100).toFixed(2) });
+r = await call('GET', `/api/t/${key}`); ok('全部结清', r.data.transfers.length === 0 && r.data.balances.every((b) => b.net === 0));
+
+// 锁定
+r = await call('POST', `/api/t/${key}/lock`, {}); ok('锁定', r.status === 200);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '1', payerId: A, shares: [{ memberId: A }] }); ok('锁定后不能记账', r.status === 423);
+r = await call('DELETE', `/api/t/${key}/expenses/${E1}`); ok('锁定后不能删', r.status === 423);
+r = await call('POST', `/api/t/${key}/unlock`, {}); ok('非管理员不能解锁', r.status === 401);
+cookie = adminCookie;
+r = await call('GET', `/api/admin/trips`); const lt = r.data.trips.find((t) => t.id === tripId);
+ok('列表：已锁定、已结清', lt && lt.locked && lt.unsettled === 0 && lt.total === 81000, JSON.stringify(lt));
+r = await call('POST', `/api/t/${key}/unlock`, {}); ok('管理员解锁', r.status === 200);
+r = await call('GET', '/api/admin/stats?year=2026'); ok('年度统计', r.status === 200 && r.data.trips.some((t) => t.id === tripId));
+r = await call('GET', '/api/admin/people'); ok('常用人名', r.data.people.includes('zz甲'));
+
+// 操作记录
+r = await call('GET', `/api/t/${key}/log`);
+ok('操作记录', r.data.items.some((i) => i.actor === 'zz乙' && /修改了一笔/.test(i.detail)) && r.data.items.some((i) => /锁定/.test(i.detail)));
+
+// 重置链接
+r = await call('POST', `/api/admin/trips/${tripId}/rekey`, {}); const newKey = r.data.key;
+r = await call('GET', `/api/t/${key}`); ok('旧链接失效', r.status === 404);
+r = await call('GET', `/api/t/${newKey}`); ok('新链接可用', r.status === 200);
+key = newKey;
+
+// CSRF：非 JSON 被拒
+r = await fetch(BASE + `/api/t/${key}/lock`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' }); ok('非 JSON 被拒', r.status === 415);
+
+// 删除游玩（连同图片）
+r = await call('DELETE', `/api/admin/trips/${tripId}`); ok('删除游玩', r.status === 200);
+r = await call('GET', `/api/t/${key}`); ok('删除后 404', r.status === 404);
+r = await call('DELETE', `/api/admin/trips/${(await call('GET', `/api/t/${key2}`)).data.trip.id}`);
+// 收款码清理
+cookie = '';
+console.log(`接口测试：通过 ${pass} 项，失败 ${fail} 项`);
+process.exit(fail ? 1 : 0);

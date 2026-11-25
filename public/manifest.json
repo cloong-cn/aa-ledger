@@ -1,0 +1,13 @@
+{
+  "id": "/",
+  "name": "AA 账本",
+  "short_name": "AA账本",
+  "description": "出去玩，花的钱平均分",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f4f1",
+  "theme_color": "#f4f4f1",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

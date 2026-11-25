@@ -1,0 +1,22 @@
+[Unit]
+Description=aa trip split ledger (aa.example.com)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+User=aa
+Group=aa
+WorkingDirectory=/srv/aa/app
+Environment=NODE_ENV=production PORT=8792 TZ=Asia/Shanghai UPLOADS=/srv/aa/uploads
+ExecStart=/usr/bin/node /srv/aa/app/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/srv/aa/app
+ReadWritePaths=/srv/aa/uploads
+
+[Install]
+WantedBy=multi-user.target

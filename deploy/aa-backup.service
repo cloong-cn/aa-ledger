@@ -1,0 +1,6 @@
+[Unit]
+Description=aa database + uploads backup
+[Service]
+Type=oneshot
+User=aa
+ExecStart=/bin/sh -c 'd=$(date +%%Y%%m%%d-%%H%%M); pg_dump -d aa | gzip > /srv/aa/backups/aa-$d.sql.gz && tar -czf /srv/aa/backups/uploads-$d.tar.gz -C /srv/aa uploads && find /srv/aa/backups -name "aa-*.sql.gz" -mtime +60 -delete && find /srv/aa/backups -name "uploads-*.tar.gz" -mtime +14 -delete'
