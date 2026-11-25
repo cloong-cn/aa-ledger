@@ -1,18 +1,53 @@
 'use strict';
 // AA 账本前端：无框架。/ = 管理员首页，/t/<key> = 某次游玩（凭分享链接）
 const $app = document.getElementById('app');
-const { computeShares, splitExpense, unitOf, roundTo } = window.AASettle;
+const { computeShares, splitExpense, exactShares, unitOf, roundTo } = window.AASettle;
 
+// 类别分两级：6 个大类（记账时一排选完）+ 小类（选了大类才出现）。统计按大类汇总，不会因为类别多而变乱。
+// 每个大类的第一个小类是默认值。新增类别时同时改 server.js 的 CATEGORIES
+const GROUPS = [
+  { key: 'eat', name: '吃喝', icon: '🍜' },
+  { key: 'stay', name: '住宿', icon: '🏨' },
+  { key: 'move', name: '交通', icon: '🚗' },
+  { key: 'play', name: '玩乐', icon: '🎫' },
+  { key: 'buy', name: '购物', icon: '🛍️' },
+  { key: 'misc', name: '其他', icon: '📦' },
+];
 const CATS = [
-  { key: 'food', name: '餐饮', icon: '🍜' },
-  { key: 'transport', name: '交通', icon: '🚗' },
-  { key: 'lodging', name: '住宿', icon: '🏨' },
-  { key: 'ticket', name: '门票', icon: '🎫' },
-  { key: 'fun', name: '娱乐', icon: '🎤' },
-  { key: 'shopping', name: '购物', icon: '🛍️' },
-  { key: 'other', name: '其他', icon: '📦' },
+  { key: 'food', name: '餐饮', icon: '🍜', g: 'eat' },
+  { key: 'snack', name: '饮品零食', icon: '🧋', g: 'eat' },
+  { key: 'grocery', name: '超市', icon: '🛒', g: 'eat' },
+  { key: 'lodging', name: '住宿', icon: '🏨', g: 'stay' },
+  { key: 'transport', name: '交通', icon: '🚗', g: 'move' },
+  { key: 'taxi', name: '打车', icon: '🚕', g: 'move' },
+  { key: 'flight', name: '机票火车', icon: '✈️', g: 'move' },
+  { key: 'rental', name: '租车', icon: '🚙', g: 'move' },
+  { key: 'fuel', name: '油费充电', icon: '⛽', g: 'move' },
+  { key: 'parking', name: '停车过路', icon: '🅿️', g: 'move' },
+  { key: 'ticket', name: '门票', icon: '🎫', g: 'play' },
+  { key: 'fun', name: '娱乐', icon: '🎤', g: 'play' },
+  { key: 'shopping', name: '购物', icon: '🛍️', g: 'buy' },
+  { key: 'gift', name: '伴手礼', icon: '🎁', g: 'buy' },
+  { key: 'other', name: '其他', icon: '📦', g: 'misc' },
 ];
 const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
+const GROUP = Object.fromEntries(GROUPS.map((g) => [g.key, g]));
+const groupOf = (key) => (CAT[key] || CAT.other).g;
+// [{key, cents}] → 按大类汇总：[{g, cents, subs:[{key, cents}]}]，金额从大到小
+function groupCats(list) {
+  const m = new Map();
+  for (const c of list) {
+    if (!c.cents) continue;
+    const g = groupOf(c.key);
+    if (!m.has(g)) m.set(g, { g: GROUP[g], cents: 0, subs: new Map() });
+    const x = m.get(g); x.cents += c.cents;
+    const k = CAT[c.key] ? c.key : 'other';
+    x.subs.set(k, (x.subs.get(k) || 0) + c.cents);
+  }
+  return [...m.values()].map((x) => ({ ...x, subs: [...x.subs].map(([key, cents]) => ({ key, cents })).sort((a, b) => b.cents - a.cents) })).sort((a, b) => b.cents - a.cents);
+}
+// 某大类下只有一个小类且名字跟大类一样时，不用再列小类
+const showSubs = (x) => x.subs.length > 1 || CAT[x.subs[0].key].name !== x.g.name;
 // 币种（顺序即选择顺序）。每次游玩有一个结算币种（默认人民币），其他币种折算成它
 const CURS = [
   { key: 'CNY', name: '人民币', short: '人民币', sym: '¥' },
@@ -557,6 +592,13 @@ function renderBills(body) {
   body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
 }
 
+// 除不尽时说明精确金额：单笔里零头先记给一个人（这样这笔加起来正好等于总额），结算时按精确值合计、最后四舍五入
+function exactNote(e) {
+  const ex = exactShares(e);
+  if (ex.every((x) => x.n % x.d === 0n)) return '';
+  const fmt = (x) => { const v = Number(x.n) / Number(x.d) / 100, t = Math.round(v * 1000) / 1000; return (Math.abs(v - t) > 1e-9 ? '约 ' : '') + t.toFixed(3).replace(/0$/, ''); };
+  return `<p class="faint tiny" style="margin:8px 0 0">这笔除不尽，精确是 ${ex.map((x) => `${esc(nameOf(x.memberId))} ${fmt(x)}`).join('，')}。结算时按精确金额合计，最后四舍五入到分。</p>`;
+}
 function expenseDetail(id) {
   const e = T().expenses.find((x) => x.id === id);
   if (!e) return;
@@ -573,6 +615,7 @@ function expenseDetail(id) {
     </div>
     <div class="card"><h2>每人分摊</h2>
       ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== BASE ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
+      ${exactNote(e)}
     </div>
     ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
@@ -618,7 +661,7 @@ function expenseForm(exp) {
     <div class="field amount-wrap cur"><span class="sym" id="f-sym"></span><input class="amount-input num" id="f-amount" inputmode="decimal" placeholder="0" value="${esc(f.amount)}" autocomplete="off"></div>
     <div id="f-fx"></div>
     <div class="field"><input class="input" id="f-title" maxlength="40" placeholder="花在什么上？例如：晚饭火锅" value="${esc(f.title)}"></div>
-    <div class="field"><div class="lab">类别</div><div class="chips" id="f-cat"></div></div>
+    <div class="field"><div class="lab">类别</div><div id="f-cat"></div></div>
     <div class="field"><div class="lab">谁付的钱</div><div class="chips" id="f-payer"></div></div>
     <div class="field"><div class="lab"><span>谁参与 AA</span><span><button type="button" class="btn ghost small" id="f-all">全选</button><button type="button" class="btn ghost small" id="f-detail"></button></span></div>
       <div class="chips" id="f-who"></div>
@@ -652,7 +695,11 @@ function expenseForm(exp) {
       $('#f-cny').oninput = (e) => { f.cny = e.target.value; preview(); };
       preview();
     };
-    const drawCats = () => { $('#f-cat').innerHTML = CATS.map((c) => `<button type="button" class="chip ${f.category === c.key ? 'on' : ''}" data-c="${c.key}">${c.icon} ${c.name}</button>`).join(''); };
+    const drawCats = () => {
+      const g = groupOf(f.category), subs = CATS.filter((c) => c.g === g);
+      $('#f-cat').innerHTML = `<div class="cat-groups">${GROUPS.map((G) => `<button type="button" class="${G.key === g ? 'on' : ''}" data-g="${G.key}"><span class="i">${G.icon}</span>${G.name}</button>`).join('')}</div>`
+        + (subs.length > 1 ? `<div class="chips cat-subs">${subs.map((c) => `<button type="button" class="chip small-chip ${f.category === c.key ? 'on' : ''}" data-c="${c.key}">${c.icon} ${c.name}</button>`).join('')}</div>` : '');
+    };
     const drawPayer = () => { $('#f-payer').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.payerId === m.id ? 'on' : ''}" data-p="${m.id}">${esc(m.name)}</button>`).join(''); };
     const drawWho = () => {
       $('#f-who').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.parts.has(m.id) ? 'on' : ''}" data-w="${m.id}">${esc(m.name)}${m.weight !== 1 ? ` ×${m.weight}` : ''}</button>`).join('');
@@ -736,7 +783,12 @@ function expenseForm(exp) {
     $('#f-cur').onclick = (e) => { const b = e.target.closest('[data-cur]'); if (b) { f.currency = b.dataset.cur; drawCur(); } };
 
     $('#f-amount').oninput = preview;
-    $('#f-cat').onclick = (e) => { const b = e.target.closest('[data-c]'); if (b) { f.category = b.dataset.c; drawCats(); } };
+    $('#f-cat').onclick = (e) => {
+      const b = e.target.closest('[data-c],[data-g]'); if (!b) return;
+      if (b.dataset.c) f.category = b.dataset.c;
+      else if (groupOf(f.category) !== b.dataset.g) f.category = CATS.find((c) => c.g === b.dataset.g).key;
+      drawCats();
+    };
     $('#f-payer').onclick = (e) => { const b = e.target.closest('[data-p]'); if (b) { f.payerId = Number(b.dataset.p); drawPayer(); } };
     $('#f-who').onclick = (e) => {
       const b = e.target.closest('[data-w]'); if (!b) return;
@@ -960,7 +1012,8 @@ function drawPoster() {
   const C = { bg: '#f4f4f1', card: '#ffffff', text: '#1c1c1a', muted: '#6f6e69', faint: '#a3a29c', line: '#e8e7e2', ink: '#1f1f22', good: '#16794c', bad: '#cf3f36' };
   const total = d.expenses.reduce((a, e) => a + e.cents, 0);
   const rows = d.balances.filter((b) => member(b.memberId));
-  const cats = CATS.map((c) => ({ ...c, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents > 0).sort((a, b) => b.cents - a.cents);
+  // 长图里按大类（最多 6 个），不会太长
+  const cats = groupCats(d.expenses.map((e) => ({ key: e.category, cents: e.cents }))).map((x) => ({ icon: x.g.icon, name: x.g.name, cents: x.cents }));
   const usedCurs = [...new Set(d.expenses.map((e) => e.currency))].filter((c) => c !== BASE && d.rates[c]);
   const rateLine = usedCurs.length ? '汇率：' + usedCurs.map((c) => `1 ${CUR[c].name}=${fmtRate(d.rates[c].rate)}`).join('，') : '';
   // 先算高度
@@ -1058,11 +1111,12 @@ function vbars(items) {
 }
 function catBars(list, total) {
   if (!list.length) return '<p class="muted small">没有数据</p>';
-  const max = Math.max(1, ...list.map((c) => c.cents));
-  return list.map((c) => {
-    const ct = CAT[c.key] || CAT.other;
-    return `<div class="hbar" title="${ct.name}：${money(c.cents)}（${Math.round((c.cents / total) * 100)}%）"><div class="lab"><span>${ct.icon} ${ct.name}</span><span class="num">${money(c.cents)} · ${Math.round((c.cents / total) * 100)}%</span></div>
-      <div class="track"><div class="fill" style="width:${(c.cents / max) * 100}%"></div></div></div>`;
+  const groups = groupCats(list), gmax = Math.max(1, ...groups.map((x) => x.cents));
+  return groups.map((x) => {
+    const pct = Math.round((x.cents / total) * 100);
+    return `<div class="hbar" title="${x.g.name}：${money(x.cents)}（${pct}%）"><div class="lab"><span>${x.g.icon} ${x.g.name}</span><span class="num">${money(x.cents)} · ${pct}%</span></div>
+      <div class="track"><div class="fill" style="width:${(x.cents / gmax) * 100}%"></div></div>
+      ${showSubs(x) ? `<div class="hbar-subs">${x.subs.map((c) => `<span>${CAT[c.key].name} <span class="num">${money(c.cents)}</span></span>`).join('')}</div>` : ''}</div>`;
   }).join('');
 }
 function bindBars(root) {

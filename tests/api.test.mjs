@@ -332,5 +332,20 @@ r = await call('GET', `/api/t/${key}`); ok('删除后 404', r.status === 404);
 r = await call('DELETE', `/api/admin/trips/${(await call('GET', `/api/t/${key2}`)).data.trip.id}`);
 // 收款码清理
 cookie = '';
+// 四舍五入：31.95 两人分（各 15.975），首页"待结清"和游玩页结算必须一致
+{
+  cookie = adminCookie;
+  let x = await call('POST', '/api/admin/trips', { name: 'zz四舍五入', startDay: '2026-11-20', members: ['zz甲', 'zz乙'] });
+  const k = x.data.key; cookie = '';
+  const t0 = (await call('GET', `/api/t/${k}`)).data; const [P, Q] = t0.members.map((m) => m.id);
+  await call('POST', `/api/t/${k}/expenses`, { amount: '31.95', payerId: P, day: '2026-11-20', shares: [{ memberId: P, weight: 1 }, { memberId: Q, weight: 1 }] });
+  const t1 = (await call('GET', `/api/t/${k}`)).data;
+  ok('31.95 两人分：乙应付 15.98（精确 15.975 四舍五入）', JSON.stringify(t1.transfers.map((y) => y.cents)) === '[1598]', JSON.stringify(t1.transfers));
+  cookie = adminCookie;
+  const list = (await call('GET', '/api/admin/trips')).data.trips;
+  ok('首页待结清 = 结算页应收', list.find((y) => y.key === k)?.unsettled === t1.balances.reduce((a, b) => a + (b.net > 0 ? b.net : 0), 0));
+  await call('DELETE', `/api/admin/trips/${t1.trip.id}`);
+  cookie = '';
+}
 console.log(`接口测试：通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

@@ -49,7 +49,9 @@ function parseWeight(v) {
 function cleanText(v, max) {
   return String(v ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim().slice(0, max);
 }
-const CATEGORIES = { food: '餐饮', transport: '交通', lodging: '住宿', ticket: '门票', fun: '娱乐', shopping: '购物', other: '其他' };
+// 类别（跟 public/app.js 的 CATS 保持一致；大类分组只在前端用）
+const CATEGORIES = { food: '餐饮', snack: '饮品零食', grocery: '超市', lodging: '住宿', transport: '交通', taxi: '打车', flight: '机票火车', rental: '租车',
+  fuel: '油费充电', parking: '停车过路', ticket: '门票', fun: '娱乐', shopping: '购物', gift: '伴手礼', other: '其他' };
 // 支持的币种。每次游玩选一个结算币种（默认人民币），其他币种按汇率折算成它
 const CURRENCIES = {
   CNY: { name: '人民币', sym: '¥' }, HKD: { name: '港币', sym: 'HK$' }, TWD: { name: '新台币', sym: 'NT$' },
@@ -259,7 +261,7 @@ async function tripPayload(trip, admin) {
     createdBy: e.created_by, createdAt: e.created_at, updatedAt: e.updated_at, ...byExp.get(e.id),
   }));
   const payments = pays.map((p) => ({ id: p.id, fromId: p.from_id, toId: p.to_id, cents: p.cents, createdBy: p.created_by, createdAt: p.created_at }));
-  const { balances, transfers } = settle(members.map((m) => m.id), expenses, payments);
+  const { balances, transfers } = settle(members.map((m) => m.id), expenses, payments, unitOf(trip.base_currency));
   const codeMap = {};
   for (const c of codes) (codeMap[c.person_id] ||= {})[c.kind] = new Date(c.updated_at).getTime();
   return {
@@ -617,7 +619,10 @@ route('GET', '/api/t/:key/export', async ({ params, admin }) => {
       ...d.members.map((m) => { const sh = e.shares.find((x) => x.memberId === m.id); return sh ? Y(sh.cents) : null; }),
       e.note, e.createdBy]),
     totalRow: ['合计', '', '', '', '', null, '', Y(exps.reduce((a, e) => a + e.cents, 0)),
-      ...d.members.map((m) => Y(exps.reduce((a, e) => a + (e.shares.find((x) => x.memberId === m.id)?.cents || 0), 0))), '', ''],
+      // 每人合计用结算结果（按精确值合计再四舍五入），可能跟上面逐笔加起来差 1 分
+      ...d.members.map((m) => Y(d.balances.find((b) => b.memberId === m.id)?.share || 0)),
+      d.members.some((m) => (d.balances.find((b) => b.memberId === m.id)?.share || 0) !== exps.reduce((a, e) => a + (e.shares.find((x) => x.memberId === m.id)?.cents || 0), 0))
+        ? '每人合计按精确金额相加后四舍五入，跟逐笔相加可能差 1 分' : '', ''],
   });
   sheets.push({
     name: '每人汇总',
@@ -800,20 +805,22 @@ route('GET', '/api/admin/trips', async () => {
     (SELECT count(*)::int FROM expenses WHERE trip_id=t.id) AS count,
     (SELECT COALESCE(sum(cents),0)::float8 FROM expenses WHERE trip_id=t.id) AS total
     FROM trips t LEFT JOIN invites i ON i.id=t.invite_id WHERE t.deleted_at IS NULL ORDER BY start_day DESC, t.id DESC`);
-  // 每人净额 = 付出 - 应摊 + 已转出 - 已收到；未结清金额 = 所有正净额之和
-  const { rows: flows } = await db.query(`
-    SELECT trip_id, payer_id AS m, sum(cents)::float8 AS c FROM expenses GROUP BY 1,2
-    UNION ALL SELECT e.trip_id, s.member_id, -sum(s.cents)::float8 FROM expense_shares s JOIN expenses e ON e.id=s.expense_id GROUP BY 1,2
-    UNION ALL SELECT trip_id, from_id, sum(cents)::float8 FROM payments GROUP BY 1,2
-    UNION ALL SELECT trip_id, to_id, -sum(cents)::float8 FROM payments GROUP BY 1,2`);
-  const net = new Map();
-  for (const r of flows) {
-    if (!net.has(r.trip_id)) net.set(r.trip_id, new Map());
-    const n = net.get(r.trip_id); n.set(r.m, (n.get(r.m) || 0) + r.c);
-  }
-  return {
-    trips: trips.map((t) => ({ ...t, unsettled: [...(net.get(t.id)?.values() || [])].reduce((a, c) => a + (c > 0 ? c : 0), 0) })),
+  // 未结清金额 = 所有人正净额之和；用跟游玩页面同一个 settle()（按精确值四舍五入），保证两边的数一样
+  const [{ rows: mems }, { rows: exps }, { rows: shares }, { rows: pays }] = await Promise.all([
+    db.query(`SELECT id, trip_id FROM members`),
+    db.query(`SELECT id, trip_id, payer_id, cents, orig_cents FROM expenses`),
+    db.query(`SELECT expense_id, member_id, weight::float AS weight, fixed_cents, cents FROM expense_shares`),
+    db.query(`SELECT trip_id, from_id, to_id, cents FROM payments`),
+  ]);
+  const shOf = new Map();
+  for (const x of shares) { if (!shOf.has(x.expense_id)) shOf.set(x.expense_id, []); shOf.get(x.expense_id).push({ memberId: x.member_id, cents: x.cents, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents }); }
+  const unsettledOf = (t) => {
+    const { balances } = settle(mems.filter((m) => m.trip_id === t.id).map((m) => m.id),
+      exps.filter((e) => e.trip_id === t.id).map((e) => ({ payerId: e.payer_id, cents: e.cents, origCents: e.orig_cents, shares: shOf.get(e.id) || [] })),
+      pays.filter((p) => p.trip_id === t.id).map((p) => ({ fromId: p.from_id, toId: p.to_id, cents: p.cents })), unitOf(t.base));
+    return balances.reduce((a, b) => a + (b.net > 0 ? b.net : 0), 0);
   };
+  return { trips: trips.map((t) => ({ ...t, unsettled: unsettledOf(t) })) };
 }, { auth: 'admin' });
 
 route('GET', '/api/admin/people', async () => {
@@ -992,7 +999,8 @@ async function verifyData() {
         if (y.cents !== x.cents || y.orig_cents !== x.origCents) { problems.push(`${tag}：成员 #${x.memberId} 分摊应为 ${x.cents / 100}（原币 ${x.origCents / 100}），存的是 ${y.cents / 100}（${y.orig_cents / 100}）`); break; }
       }
     } catch (err) { problems.push(`${tag}：没法重算分摊（${err.message}）`); }
-    byTrip.get(e.trip_id).expenses.push({ payerId: e.payer_id, cents: e.cents, shares: sh.map((x) => ({ memberId: x.member_id, cents: x.cents })) });
+    byTrip.get(e.trip_id).expenses.push({ payerId: e.payer_id, cents: e.cents, origCents: e.orig_cents,
+      shares: sh.map((x) => ({ memberId: x.member_id, cents: x.cents, weight: x.fixed_cents != null ? 0 : Number(x.weight), fixed: x.fixed_cents })) });
   }
   for (const p of pays) {
     if (p.cents % unitOf(tripById.get(p.trip_id).base)) problems.push(`${where(tripById.get(p.trip_id))} 转账 #${p.id}：金额不是整数单位`);
@@ -1000,7 +1008,7 @@ async function verifyData() {
   }
   for (const t of trips) {
     const d = byTrip.get(t.id);
-    const { balances, transfers } = settle(d.members, d.expenses, d.payments);
+    const { balances, transfers } = settle(d.members, d.expenses, d.payments, unitOf(t.base));
     const sum = balances.reduce((a, b) => a + b.net, 0);
     if (sum !== 0) problems.push(`${where(t)}：所有人的净额加起来不是 0（差 ${sum / 100}）`);
     const unsettled = balances.reduce((a, b) => a + (b.net > 0 ? b.net : 0), 0);
@@ -1040,11 +1048,11 @@ route('GET', '/api/admin/stats', async ({ query }) => {
   const [{ rows: trips }, { rows: exps }, { rows: shares }, { rows: mems }, { rows: rates }, { rows: years }] = await Promise.all([
     db.query(`SELECT id, name, to_char(start_day,'YYYY-MM-DD') AS "startDay", base_currency AS base,
       (SELECT count(*)::int FROM members WHERE trip_id=t.id) AS members FROM trips t WHERE start_day >= $1 AND start_day < $2 AND deleted_at IS NULL ORDER BY start_day`, [from, to]),
-    db.query(`SELECT e.trip_id, e.category, e.cents, m.person_id FROM expenses e JOIN trips t ON t.id=e.trip_id JOIN members m ON m.id=e.payer_id
+    db.query(`SELECT e.id, e.trip_id, e.category, e.cents, e.orig_cents, e.payer_id, m.person_id FROM expenses e JOIN trips t ON t.id=e.trip_id JOIN members m ON m.id=e.payer_id
       WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
-    db.query(`SELECT e.trip_id, s.cents, m.person_id FROM expense_shares s JOIN expenses e ON e.id=s.expense_id JOIN trips t ON t.id=e.trip_id
+    db.query(`SELECT s.expense_id, s.member_id, s.weight::float AS weight, s.fixed_cents, s.cents FROM expense_shares s JOIN expenses e ON e.id=s.expense_id JOIN trips t ON t.id=e.trip_id
       JOIN members m ON m.id=s.member_id WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
-    db.query(`SELECT m.trip_id, p.id AS person_id, p.name FROM members m JOIN people p ON p.id=m.person_id JOIN trips t ON t.id=m.trip_id
+    db.query(`SELECT m.id, m.trip_id, p.id AS person_id, p.name FROM members m JOIN people p ON p.id=m.person_id JOIN trips t ON t.id=m.trip_id
       WHERE t.start_day >= $1 AND t.start_day < $2 AND t.deleted_at IS NULL`, [from, to]),
     db.query(`SELECT trip_id, currency, rate::float AS rate FROM trip_rates`),
     db.query(`SELECT DISTINCT extract(year FROM start_day)::int AS y FROM trips WHERE deleted_at IS NULL ORDER BY 1 DESC`),
@@ -1060,7 +1068,15 @@ route('GET', '/api/admin/stats', async ({ query }) => {
     people.get(m.person_id).trips++;
   }
   for (const e of exps) if (people.has(e.person_id)) people.get(e.person_id).paid += cny(e.trip_id, e.cents);
-  for (const s of shares) if (people.has(s.person_id)) people.get(s.person_id).share += cny(s.trip_id, s.cents);
+  // 应摊用每次游玩的结算结果（按精确值四舍五入），跟游玩页面上的数一致
+  const personOf = new Map(mems.map((m) => [m.id, m.person_id]));
+  const shOf = new Map();
+  for (const x of shares) { if (!shOf.has(x.expense_id)) shOf.set(x.expense_id, []); shOf.get(x.expense_id).push({ memberId: x.member_id, cents: x.cents, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents }); }
+  for (const t of trips) {
+    const te = exps.filter((e) => e.trip_id === t.id).map((e) => ({ payerId: e.payer_id, cents: e.cents, origCents: e.orig_cents, shares: shOf.get(e.id) || [] }));
+    const { balances } = settle(mems.filter((m) => m.trip_id === t.id).map((m) => m.id), te, [], unitOf(t.base));
+    for (const b of balances) { const p = people.get(personOf.get(b.memberId)); if (p) p.share += cny(t.id, b.share); }
+  }
   const cats = new Map();
   for (const e of exps) cats.set(e.category, (cats.get(e.category) || 0) + cny(e.trip_id, e.cents));
   const months = new Map();

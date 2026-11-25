@@ -63,18 +63,61 @@
 
   function shareError(msg) { const e = new Error(msg); e.status = 400; return e; }
 
-  // 结算：每人净额 = 垫付 - 应摊 + 已转出 - 已收到（正数=别人还欠他，负数=他还要给别人）。
+  // 一笔账里每人"精确"应摊多少（结算币种的分，可能带小数），用分数 {n, d}（BigInt）表示，不丢任何精度。
+  // 按份数 / 指定金额的比例来分：份额 = 结算币种总额 × 原币份额 / 原币总额。
+  // 旧数据或测试数据里没有份数信息时，就以存下来的分为准。
+  function exactShares(e) {
+    const sh = e.shares;
+    if (!sh.length || sh.some((s) => s.weight == null && s.fixed == null)) return sh.map((s) => ({ memberId: s.memberId, n: BigInt(s.cents), d: 1n }));
+    const orig = e.origCents != null ? e.origCents : e.cents;
+    const fixedSum = sh.reduce((a, s) => a + (s.fixed != null ? s.fixed : 0), 0);
+    const units = sh.map((s) => (s.fixed != null ? 0 : Math.round(s.weight * 100)));
+    const W = units.reduce((a, b) => a + b, 0);
+    const C = BigInt(e.cents), O = BigInt(orig);
+    return sh.map((s, i) => {
+      // 原币份额 = fixed，或 (原币总额 - 指定合计) × 份数 / 总份数
+      const pn = s.fixed != null ? BigInt(s.fixed) * BigInt(W || 1) : BigInt(orig - fixedSum) * BigInt(units[i]);
+      return { memberId: s.memberId, n: C * pn, d: O * BigInt(W || 1) };
+    });
+  }
+  const gcd = (a, b) => { a = a < 0n ? -a : a; b = b < 0n ? -b : b; while (b) [a, b] = [b, a % b]; return a || 1n; };
+  const addF = (x, y) => { const n = x.n * y.d + y.n * x.d, d = x.d * y.d, g = gcd(n, d); return { n: n / g, d: d / g }; };
+
+  // 结算：先按精确值算出每人"垫付 - 应摊"，再四舍五入到最小单位（分；日元是円），只在最后取整一次，
+  // 跟用计算器按精确金额算出来的一致（例如 31.95 两人分，各 15.975，最后差额 8.225 → 8.23）。
+  // 极少数情况下（三人以上同时出现半分）四舍五入后加起来不是 0，就把差额从"进位最多"的人身上扣回来，保证一分不多一分不少。
+  // 净额 = 上面取整后的结果 + 已转出 - 已收到（正数=别人还欠他，负数=他还要给别人）。
   // 然后让欠得最多的人转给被欠得最多的人，反复配对，转账笔数最多是"人数-1"。
-  function settle(memberIds, expenses, payments) {
+  // unit：结算币种最小单位（日元 100，其余 1）
+  function settle(memberIds, expenses, payments, unit) {
+    unit = unit || 1;
     const b = new Map(memberIds.map((id) => [id, { memberId: id, paid: 0, share: 0, sent: 0, received: 0, net: 0 }]));
     const get = (id) => { if (!b.has(id)) b.set(id, { memberId: id, paid: 0, share: 0, sent: 0, received: 0, net: 0 }); return b.get(id); };
+    const exact = new Map();
     for (const e of expenses) {
       get(e.payerId).paid += e.cents;
-      for (const s of e.shares) get(s.memberId).share += s.cents;
+      for (const s of exactShares(e)) { get(s.memberId); exact.set(s.memberId, addF(exact.get(s.memberId) || { n: 0n, d: 1n }, s)); }
     }
     for (const p of payments) { get(p.fromId).sent += p.cents; get(p.toId).received += p.cents; }
     const balances = [...b.values()];
-    for (const x of balances) x.net = x.paid - x.share + x.sent - x.received;
+    // 精确的"垫付 - 应摊"，四舍五入到 unit
+    const U = BigInt(unit);
+    const rounded = balances.map((x) => {
+      const sh = exact.get(x.memberId) || { n: 0n, d: 1n };
+      const n = BigInt(x.paid) * sh.d - sh.n, d = sh.d;               // 精确值 n/d 分
+      const neg = n < 0n, a = neg ? -n : n;
+      const q = (2n * a + d * U) / (2n * d * U);                       // 绝对值四舍五入到 unit
+      const r = Number(neg ? -q * U : q * U);
+      return { x, r, en: BigInt(r) * d - n, ed: d };                  // 取整多算了 en/ed 分（用于极少数的差额修正）
+    });
+    let sum = rounded.reduce((a, y) => a + y.r, 0);
+    if (sum) {
+      // 要往下调就先调"进位最多"的人，往上调就先调"舍掉最多"的人；完全一样时按成员编号，结果固定
+      const cmp = (p, q) => { const a = p.en * q.ed, b = q.en * p.ed; return a > b ? 1 : a < b ? -1 : 0; };
+      const order = rounded.slice().sort((p, q) => (sum > 0 ? cmp(q, p) : cmp(p, q)) || p.x.memberId - q.x.memberId);
+      for (let k = 0; sum; k = (k + 1) % order.length) { const s = sum > 0 ? -unit : unit; order[k].r += s; sum += s; }
+    }
+    for (const { x, r } of rounded) { x.share = x.paid - r; x.net = r + x.sent - x.received; }
 
     const debtors = balances.filter((x) => x.net < 0).map((x) => ({ id: x.memberId, amt: -x.net }));
     const creditors = balances.filter((x) => x.net > 0).map((x) => ({ id: x.memberId, amt: x.net }));
@@ -98,5 +141,5 @@
   // 按最小单位取整
   const roundTo = (cents, unit) => Math.round(cents / unit) * unit;
 
-  return { computeShares, distribute, splitExpense, settle, unitOf, roundTo };
+  return { computeShares, distribute, splitExpense, exactShares, settle, unitOf, roundTo };
 });

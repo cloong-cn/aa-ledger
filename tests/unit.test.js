@@ -113,5 +113,64 @@ eq('日元结算零头', splitExpense(1000, 47800, [1, 2, 3].map((id) => ({ memb
   eq('大金额按比例分', [big.reduce((a, b) => a + b, 0), big.every((x) => Number.isSafeInteger(x))], [999999999, true]);
   eq('录入顺序无关（固定例子）', splitExpense(100, 100, [3, 1, 2].map((id) => ({ memberId: id, weight: 1, fixed: null })), 1, 1).map((x) => [x.memberId, x.cents]), [[3, 33], [1, 34], [2, 33]]);
 }
+
+// ---------- 四舍五入：结算按精确值算，最后取整一次 ----------
+{
+  const W1 = (ids) => ids.map((id) => ({ memberId: id, weight: 1, fixed: null }));
+  const mk = (payerId, cents, ids, parts) => {
+    const p = parts || W1(ids);
+    return { payerId, cents, origCents: cents, shares: splitExpense(cents, cents, p, 1, 1).map((x) => ({ memberId: x.memberId, weight: x.weight, fixed: x.fixed, cents: x.cents })) };
+  };
+  // 真实例子（北京游玩）：31.95 两人分各 15.975，任 应付 8.225 → 8.23
+  const bj = [mk(130, 10200, [129, 130]), mk(130, 7000, [129]), mk(129, 19250, [129, 130]), mk(129, 3195, [129, 130]), mk(129, 3400, [129, 130])];
+  let r = settle([129, 130], bj, []);
+  eq('北京：转账 8.23', r.transfers, [{ fromId: 130, toId: 129, cents: 823 }]);
+  eq('北京：应摊', r.balances.map((b) => [b.paid, b.share]), [[25845, 25022], [17200, 18023]]);
+  r = settle([129, 130], bj, [{ fromId: 130, toId: 129, cents: 823 }]);
+  eq('北京：转完结清', [r.transfers.length, r.balances.map((b) => b.net)], [0, [0, 0]]);
+  // 三人分 100，A 付：精确 +66.667 / -33.333 / -33.333 → 四舍五入后差 1 分，修正后仍然加起来是 0
+  r = settle([1, 2, 3], [mk(1, 10000, [1, 2, 3])], []);
+  eq('三人半分修正后和为 0', r.balances.reduce((a, b) => a + b.net, 0), 0);
+  // 日元结算：取整到円
+  r = settle([1, 2], [{ payerId: 1, cents: 300, origCents: 300, shares: [{ memberId: 1, weight: 1, fixed: null, cents: 200 }, { memberId: 2, weight: 1, fixed: null, cents: 100 }] }], [], 100);
+  eq('日元：精确 1.5 円 → 2 円', r.transfers, [{ fromId: 2, toId: 1, cents: 200 }]);
+  // 外币：按原币比例折算，精确值 = 本币总额 × 原币份额 / 原币总额
+  r = settle([1, 2], [{ payerId: 1, cents: 1001, origCents: 5000, shares: [{ memberId: 1, weight: 1, fixed: 3000, cents: 601 }, { memberId: 2, weight: 1, fixed: 2000, cents: 400 }] }], []);
+  eq('外币指定金额：1001×2000/5000=400.4 → 4.00', r.transfers, [{ fromId: 2, toId: 1, cents: 400 }]);
+
+  // 随机：跟"独立的精确算法"（分数逐笔相加，只在最后四舍五入）对比
+  let seed = 7; const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  // 独立实现：分母统一乘到 L = 所有 W×orig 的乘积太大，改用逐人有理数（Number 分子分母在小数据下足够精确）
+  const frac = (n, d) => ({ n, d });
+  const g = (a, b) => (b ? g(b, a % b) : Math.abs(a));
+  const add = (x, y) => { const n = x.n * y.d + y.n * x.d, d = x.d * y.d, k = g(n, d) || 1; return frac(n / k, d / k); };
+  let bad2 = 0;
+  for (let i = 0; i < 3000 && !bad2; i++) {
+    const n = 2 + Math.floor(rnd() * 3), ids = Array.from({ length: n }, (_, k) => k + 1);
+    const exps = Array.from({ length: 1 + Math.floor(rnd() * 6) }, () => {
+      const who = ids.filter(() => rnd() < 0.7); if (!who.length) who.push(1);
+      return mk(pick(ids), 1 + Math.floor(rnd() * 20000), who, who.map((id) => ({ memberId: id, weight: pick([1, 1, 2, 0.5]), fixed: null })));
+    });
+    const ex = new Map(ids.map((id) => [id, frac(0, 1)]));
+    for (const e of exps) {
+      ex.set(e.payerId, add(ex.get(e.payerId), frac(e.cents, 1)));
+      const U = e.shares.reduce((a, s) => a + Math.round(s.weight * 100), 0);
+      for (const s of e.shares) ex.set(s.memberId, add(ex.get(s.memberId), frac(-e.cents * Math.round(s.weight * 100), U)));
+    }
+    const { balances, transfers } = settle(ids, exps, []);
+    const sum = balances.reduce((a, b) => a + b.net, 0);
+    for (const b of balances) {
+      const v = ex.get(b.memberId).n / ex.get(b.memberId).d;
+      const half = Math.sign(v) * Math.round(Math.abs(v)); // 普通四舍五入（绝对值）
+      // 两个人时一定跟计算器一致；三人以上允许为了"加起来是 0"差 1 分
+      if (n === 2 ? b.net !== half : Math.abs(b.net - v) >= 1) { bad2++; console.log('✗ 四舍五入', n, b, v, JSON.stringify(exps)); break; }
+    }
+    if (sum !== 0 || transfers.length > n - 1) { bad2++; console.log('✗ 四舍五入后不平', sum); }
+    const after = settle(ids, exps, transfers);
+    if (after.transfers.length) { bad2++; console.log('✗ 转完没清零'); }
+  }
+  bad2 ? fail++ : pass++;
+}
 console.log(`算法测试：通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

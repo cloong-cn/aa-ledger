@@ -232,6 +232,15 @@ textarea.input { resize: vertical; min-height: 64px; }
 .hbar .fill { height: 100%; border-radius: 4px; background: var(--bar); min-width: 2px; }
 .hbar .fill.b2 { background: var(--bar-2); }
 .hbar .track + .track { margin-top: 3px; }
+.hbar-subs { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 5px; font-size: 12px; color: var(--muted); }
+/* 记账表单的类别：6 个大类一排，选中后下面出现小类 */
+.cat-groups { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.cat-groups button { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: var(--r-sm); padding: 8px 0 6px; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; gap: 3px; font: inherit; font-size: 12.5px; }
+.cat-groups button .i { font-size: 20px; line-height: 1; }
+.cat-groups button.on { background: var(--ink); color: var(--on-ink); border-color: var(--ink); }
+.cat-subs { margin-top: 8px; }
+.cat-subs .chip.on { background: var(--soft); color: var(--text); border-color: var(--ink); }
 .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); margin: -4px 0 12px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; background: var(--bar); }
 .legend i.b2 { background: var(--bar-2); }
