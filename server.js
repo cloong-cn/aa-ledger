@@ -740,7 +740,7 @@ route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) =>
       for (const i of images) await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,created_at) VALUES($1,$2,$3,$4,$5,$6)`, [i.id, x.id, i.file, i.mime, i.bytes, i.created_at]);
     }
     await log(q, trip.id, actor, t.kind + '.restore', `恢复了${t.kind === 'image' ? '' : '一笔：'}${t.label}`);
-    return { ok: true };
+    return { ok: true, expenseId: t.kind === 'image' ? t.data.image.expense_id : t.data.expense.id };
   });
 });
 

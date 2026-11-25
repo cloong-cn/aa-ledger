@@ -283,7 +283,12 @@ textarea.input { resize: vertical; min-height: 64px; }
   background: var(--bg); border-radius: 22px 22px 0 0; padding: 8px 16px calc(20px + env(safe-area-inset-bottom));
   max-width: 600px; margin: 0 auto; animation: up .22s ease-out; }
 @keyframes up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { #sheet { animation: none; } }
+#sheet.closing { animation: down .18s ease-in forwards; }
+@keyframes down { to { transform: translateY(40px); opacity: 0; } }
+#sheet-backdrop { animation: fade-in .22s ease-out; }
+#sheet-backdrop.closing { animation: fade-out .18s ease-in forwards; }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes fade-out { to { opacity: 0; } }
 #sheet .grab { width: 38px; height: 5px; background: var(--line); border-radius: 3px; margin: 0 auto 10px; }
 #sheet .sh-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
 #sheet .sh-head h3 { margin: 0; font-size: 18px; flex: 1; }
@@ -329,3 +334,17 @@ details[open] > summary::before { content: "▾ "; }
 .filter-row::-webkit-scrollbar { display: none; }
 .filter-row .chip { flex: none; }
 .more-chip { color: var(--muted); border-style: dashed; }
+
+/* ========== 动效（都很短；系统开了「减少动态效果」就全部关掉） ========== */
+/* 1. 按下反馈：按钮、列表行、选项按下时缩一点，让人知道点到了 */
+.btn, .chip, .chip-me, .icon-btn, .cat-groups button, .tabbar button, .item, .trip { -webkit-tap-highlight-color: transparent; transition: transform .12s ease, filter .12s ease; }
+.btn:active:not(:disabled), .chip:active, .chip-me:active, .icon-btn:active, .cat-groups button:active, .tabbar button:active { transform: scale(.95); }
+.item:active, .trip:active { transform: scale(.985); filter: brightness(.96); }
+/* 3. 刚改过的行闪一下；转账行标记已转后滑走 */
+.flash { animation: flash 1.6s ease-out; }
+@keyframes flash { 0%, 35% { background-color: var(--accent-soft); } }
+.fold { animation: fold .22s ease-in forwards; }
+@keyframes fold { to { opacity: 0; transform: translateX(32px); } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

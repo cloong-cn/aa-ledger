@@ -121,7 +121,11 @@ async function api(method, url, body, { raw = false } = {}) {
 // ---------- 弹层 ----------
 const $sheet = document.getElementById('sheet');
 const $back = document.getElementById('sheet-backdrop');
+// 动效：弹层关闭时先往下滑出再隐藏；系统开了「减少动态效果」就直接隐藏
+const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+let closeTimer = null;
 function openSheet(html, onMount) {
+  clearTimeout(closeTimer); $sheet.classList.remove('closing'); $back.classList.remove('closing');
   $sheet.innerHTML = `<div class="grab"></div>${html}`;
   $sheet.hidden = false; $back.hidden = false;
   document.body.style.overflow = 'hidden';
@@ -129,8 +133,26 @@ function openSheet(html, onMount) {
   onMount && onMount($sheet);
 }
 function closeSheet() {
-  $sheet.hidden = true; $back.hidden = true; $sheet.innerHTML = '';
   document.body.style.overflow = '';
+  const done = () => { $sheet.hidden = true; $back.hidden = true; $sheet.innerHTML = ''; $sheet.classList.remove('closing'); $back.classList.remove('closing'); };
+  clearTimeout(closeTimer);
+  if ($sheet.hidden || reduceMotion()) return done();
+  $sheet.classList.add('closing'); $back.classList.add('closing');
+  closeTimer = setTimeout(done, 180);
+}
+// 刚改过的那一行闪一下浅色，不在屏幕里就滚过去
+function flash(sel) {
+  const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+  if (!el) return;
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  const r = el.getBoundingClientRect();
+  if (r.top < 70 || r.bottom > window.innerHeight - 90) el.scrollIntoView({ block: 'center', behavior: reduceMotion() ? 'auto' : 'smooth' });
+}
+// 一行先滑出淡掉（约 0.22 秒），再继续
+function foldAway(el) {
+  if (!el || reduceMotion()) return Promise.resolve();
+  el.classList.add('fold');
+  return new Promise((r) => setTimeout(r, 220));
 }
 $back.addEventListener('click', closeSheet);
 const sheetHead = (title) => `<div class="sh-head"><h3>${esc(title)}</h3><button class="icon-btn" data-close aria-label="关闭">✕</button></div>`;
@@ -289,7 +311,7 @@ function tripListHtml(trips) {
     const status = t.locked ? '<span class="tag">已锁定</span>'
       : t.unsettled > 0 ? `<span class="tag warn">待结清 ${curMoney(t.base, t.unsettled)}</span>`
       : t.count ? '<span class="tag good">已结清</span>' : '<span class="tag">还没记账</span>';
-    html += `<a class="trip" href="/t/${esc(t.key)}" data-link>
+    html += `<a class="trip" href="/t/${esc(t.key)}" data-tid="${t.id}" data-link>
       <div class="r1"><b>${esc(t.name)}</b><span class="amt num">${curMoney(t.base, t.total)}</span></div>
       <div class="r2"><span>${range(t)} · ${t.members} 人 · ${t.count} 笔${t.inviteNote ? ` · 🎟️${esc(t.inviteNote)}` : ''}</span>${status}</div></a>`;
   }
@@ -386,7 +408,11 @@ async function tripTrashSheet() {
       <button class="btn small" data-tr="${t.id}">恢复</button></div>`).join('') : '<div class="empty small">回收站是空的</div>'}</div>`, (el) => {
     el.querySelectorAll('[data-tr]').forEach((b) => b.onclick = async () => {
       b.disabled = true;
-      try { await api('POST', `/api/admin/trips/${b.dataset.tr}/restore`); toast('已恢复'); closeSheet(); renderAdmin(); }
+      try {
+        await api('POST', `/api/admin/trips/${b.dataset.tr}/restore`); toast('已恢复');
+        await foldAway(b.closest('.mem')); closeSheet();
+        await renderAdmin(); flash(`.trip[data-tid="${b.dataset.tr}"]`);
+      }
       catch (e) { b.disabled = false; toast(e.message, true); }
     });
   });
@@ -614,6 +640,7 @@ function renderBills(body) {
   body.innerHTML = html;
   body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
   body.querySelectorAll('[data-f]').forEach((b) => b.onclick = () => { S.billFilter = b.dataset.f; renderBills(body); });
+  if (S.flashExp) { const id = S.flashExp; S.flashExp = null; requestAnimationFrame(() => flash(`[data-exp="${id}"]`)); }
 }
 
 // 除不尽时说明精确金额：单笔里零头先记给一个人（这样这笔加起来正好等于总额），结算时按精确值合计、最后四舍五入
@@ -891,8 +918,9 @@ function expenseForm(exp) {
         newFiles.forEach((x) => URL.revokeObjectURL(x.url));
         closeSheet();
         toast(failed ? `已保存，但有 ${failed} 张图片没传上去` : exp ? '已修改' : '记好了', !!failed);
-        S.tab = 'bills';
+        S.tab = 'bills'; S.billFilter = 'all';
         await refresh();
+        flash(`[data-exp="${res.id}"]`);
       } catch (e2) {
         err.textContent = e2.message; saving = false;
         $('#f-save').disabled = false; $('#f-save').textContent = exp ? '保存修改' : '记下来';
@@ -921,7 +949,7 @@ function renderSettle(body) {
         const to = member(x.toId);
         const hasCode = to && (to.codes.wechat || to.codes.alipay);
         const mine = S.me && (x.fromId === S.me || x.toId === S.me);
-        return `<div class="xfer ${mine ? 'me' : ''}"><div class="who" data-remind="${i}" role="button" tabindex="0" title="复制提醒文字"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
+        return `<div class="xfer ${mine ? 'me' : ''}" data-ft="${x.fromId}-${x.toId}"><div class="who" data-remind="${i}" role="button" tabindex="0" title="复制提醒文字"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
           <div class="acts"><button class="btn small" data-remind="${i}">催款</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
       }).join('')}
       <div style="padding:10px 16px 12px"><button class="btn block" id="remind-all">📋 复制催款消息（发到群里）</button></div></div>`;
@@ -938,7 +966,7 @@ function renderSettle(body) {
     }).join('')}</tbody></table>
     <p class="faint tiny" style="margin:10px 0 0">垫付 = 替大家付的钱；应摊 = 自己该承担的部分；结果 = 垫付 − 应摊，再扣除「已转账」的金额${d.balances.some((b) => !Number.isInteger(b.share)) ? '。<br>有的账除不尽（比如 31.95 两人分，每人 15.975），应摊显示的是精确值，结果四舍五入到分' : ''}</p></div>`;
   if (d.payments.length) {
-    html += `<div class="card"><h2>已转账</h2>${d.payments.slice().reverse().map((p) => `<div class="kv"><span>✓ ${esc(nameOf(p.fromId))} → ${esc(nameOf(p.toId))} <span class="faint tiny">${fmtTime(p.createdAt)}</span></span>
+    html += `<div class="card"><h2>已转账</h2>${d.payments.slice().reverse().map((p) => `<div class="kv" data-pay="${p.id}"><span>✓ ${esc(nameOf(p.fromId))} → ${esc(nameOf(p.toId))} <span class="faint tiny">${fmtTime(p.createdAt)}</span></span>
       <span class="num">${money(p.cents)}${editable() ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
   }
   html += `<div class="btns" style="margin-top:4px"><button class="btn" id="poster">🖼️ 生成结算长图</button>${editable() && d.transfers.length ? '<button class="btn" id="lock">🔒 锁定账单</button>' : ''}</div>`;
@@ -984,9 +1012,11 @@ function paidSheet(x) {
     <button class="btn primary block" id="pd-ok">确认已转</button>`, (el) => {
     el.querySelector('#pd-ok').onclick = async () => {
       try {
-        await api('POST', `/api/t/${S.key}/payments`, { fromId: x.fromId, toId: x.toId, amount: el.querySelector('#pd-amt').value.trim() });
+        const pr = await api('POST', `/api/t/${S.key}/payments`, { fromId: x.fromId, toId: x.toId, amount: el.querySelector('#pd-amt').value.trim() });
         closeSheet(); toast('已标记');
+        await foldAway(document.querySelector(`.xfer[data-ft="${x.fromId}-${x.toId}"]`));
         await refresh();
+        flash(`[data-pay="${pr.id}"]`);
         if (!T().transfers.length && editable()) {
           if (await confirmSheet('全部结清了 🎉', '要现在锁定账单吗？锁定后所有人都不能再修改，需要改时管理员可以解锁。', '锁定')) lockTrip(true);
         }
@@ -1425,7 +1455,13 @@ async function trashSheet() {
       ${ed ? `<button class="btn small" data-restore="${i.id}">恢复</button>` : ''}</div>`).join('') : '<div class="empty small">没有删除过东西</div>'}</div>`, (el) => {
     el.querySelectorAll('[data-restore]').forEach((b) => b.onclick = async () => {
       b.disabled = true;
-      try { await api('POST', `/api/t/${S.key}/trash/${b.dataset.restore}/restore`); toast('已恢复'); await refresh(); trashSheet(); }
+      try {
+        const r2 = await api('POST', `/api/t/${S.key}/trash/${b.dataset.restore}/restore`);
+        toast(r2.expenseId ? '已恢复，回到账单可以看到' : '已恢复');
+        S.flashExp = r2.expenseId || null; S.billFilter = 'all';
+        await foldAway(b.closest('.mem'));
+        await refresh(); trashSheet();
+      }
       catch (e) { b.disabled = false; toast(e.message, true); }
     });
   });
