@@ -2,8 +2,8 @@
 
 给接手维护的人看的。读完前三节就能上手。改动之前，先看「四、金额规则」和「五、数据安全机制」。
 
-- 线上地址：https://aa.example.com
-- 代码：`/srv/aa/app`，GitHub 私有仓库 https://github.com/cloong-cn/aa-ledger （分支 main；服务器上用 root 的 gh 登录推送），每天的备份里也有一份 git bundle
+- 线上地址：本文和 `deploy/` 里的域名都写成占位的 `aa.example.com`，实际域名记在服务器的 `/srv/aa/OPS.md`（不进 git）。部署到新域名时，把 `deploy/nginx.conf` 里的 `aa.example.com` 换掉即可，程序本身不依赖域名
+- 代码：`/srv/aa/app`，GitHub 公开仓库 https://github.com/cloong-cn/aa-ledger （分支 main；服务器上用 root 的 gh 登录推送），每天的备份里也有一份 git bundle
 - 技术栈：Node.js 24（只依赖 `pg`）+ PostgreSQL 15 + 原生 JS 前端（无框架、无构建步骤）
 
 ---
@@ -52,7 +52,7 @@ git push                                                # 推到 GitHub
 | 测试 | `tests/`（`run.sh` 入口；`unit.test.js` 算法；`api.test.mjs` 接口；`cleanup.sql` 清测试数据） |
 | systemd / nginx / 备份脚本样本 | `deploy/` |
 | 服务 | `aa.service`，用户 `aa`，监听 `127.0.0.1:8792` |
-| Nginx 配置 | `/etc/nginx/conf.d/aa.conf`（来自 `deploy/nginx.conf`） |
+| Nginx 配置 | `/etc/nginx/conf.d/aa.conf`（来自 `deploy/nginx.conf`，域名已换成真实的） |
 | HTTPS 证书 | `/etc/letsencrypt/live/aa.example.com/`（certbot 自动续期） |
 | 数据库 | 本机 PostgreSQL 15，库 `aa`，用 unix socket + peer 认证（无密码）；`pg_hba.conf` 限制 aa 角色只能连 aa 库 |
 | 截图 / 收款码文件 | `/srv/aa/uploads`（文件名是随机 32 位十六进制，内容不会变） |
@@ -205,6 +205,8 @@ git clone /srv/aa/backups/code-YYYYMMDD.bundle /srv/aa/app-restored
 | 磁盘快满 | 先 `du -sh /srv/aa/uploads /srv/aa/backups`。不要手动删最新的备份，可以缩短 `backup.sh` 里的保留天数 |
 
 ## 九、安全设计（不要无意中破坏）
+
+- **仓库是公开的**：不要提交真实域名、服务器 IP、密码、`.env`、数据库导出、截图或任何真实账目数据（测试只用 zz 开头的假数据）。提交前可以跑 `git grep -nE '<真实域名>|<服务器IP>'` 检查一遍。
 
 - **分享链接 = 这次游玩的全部权限**。密钥是 128 位随机数。nginx 设了 `Referrer-Policy: same-origin`，避免链接通过 Referer 泄露，不要去掉。
 - **CSRF 防护**：修改类接口只接受 `application/json`，上传图片只接受 `image/*`，并且会检查文件头。新增接口时也要遵守。
