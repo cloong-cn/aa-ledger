@@ -3,7 +3,7 @@
 给接手维护的人看的。读完前三节就能上手。改动之前，先看「四、金额规则」和「五、数据安全机制」。
 
 - 线上地址：https://aa.example.com
-- 代码：`/srv/aa/app`（本地 git 仓库，**没有远程仓库**，每天的备份里有完整 git bundle）
+- 代码：`/srv/aa/app`，GitHub 私有仓库 https://github.com/cloong-cn/aa-ledger （分支 main；服务器上用 root 的 gh 登录推送），每天的备份里也有一份 git bundle
 - 技术栈：Node.js 24（只依赖 `pg`）+ PostgreSQL 15 + 原生 JS 前端（无框架、无构建步骤）
 
 ---
@@ -35,6 +35,7 @@ sudo -u aa sh deploy/backup.sh                          # 先备份（会改数�
 chown -R aa:aa /srv/aa/app && systemctl restart aa
 sh tests/run.sh                                         # 必须全部通过
 git add -A && git commit -m "说明改了什么"
+git push                                                # 推到 GitHub
 ```
 
 **回滚**：先 `git log` 找到上一个版本，再 `git checkout <版本> -- .`，然后 `systemctl restart aa`。数据库结构只加不删（见「七」），所以旧代码也能在新库上运行。
@@ -117,7 +118,7 @@ git add -A && git commit -m "说明改了什么"
 |---|---|---|
 | `aa-YYYYMMDD-HHMM.sql.gz` | 整个数据库（pg_dump） | 60 天；最新 7 份永远保留 |
 | `uploads/` | 截图和收款码的增量镜像 | 服务器上删掉的图片，在这里再留 90 天 |
-| `code-YYYYMMDD.bundle` | 代码仓库完整历史 | 30 天 |
+| `code-YYYYMMDD.bundle` | 代码仓库完整历史（GitHub 上也有） | 30 天 |
 
 备份结束后还会跑一次 `node server.js check`。检查结果会写进 `journalctl -u aa-backup` 的日志。
 
@@ -155,7 +156,7 @@ git clone /srv/aa/backups/code-YYYYMMDD.bundle /srv/aa/app-restored
 ### 6.5 搬到新服务器
 
 1. 装好 Node 24、PostgreSQL 15、nginx 和 certbot。
-2. `useradd -r -d /srv/aa aa`，然后从 bundle 克隆代码到 `/srv/aa/app`，在里面运行 `npm ci`。
+2. `useradd -r -d /srv/aa aa`，然后 `git clone https://github.com/cloong-cn/aa-ledger /srv/aa/app`（或从 bundle 克隆），在里面运行 `npm ci`。
 3. `createuser aa && createdb -O aa aa`，然后按 6.2 导入数据库并复制图片。
 4. 复制 `deploy/` 里的 service、timer 和 nginx 配置，再申请证书：`certbot --nginx -d aa.example.com`。
 5. 启用服务和定时器：`systemctl enable --now aa aa-backup.timer`。
