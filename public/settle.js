@@ -30,6 +30,26 @@
       cents: p.fixed != null ? p.fixed : out.get(p.memberId),
     }));
   }
+  // 按比例把 total 分成若干份（amounts 是各自的原币金额），用 BigInt 防溢出，零头按最大余数补，保证加起来正好等于 total
+  function distribute(total, amounts) {
+    const A = amounts.reduce((a, b) => a + b, 0);
+    if (A === 0) { const out = amounts.map(() => 0); if (out.length) out[0] = total; return out; }
+    const T = BigInt(total), BA = BigInt(A);
+    const base = amounts.map((a) => Number((T * BigInt(a)) / BA));
+    let left = total - base.reduce((a, b) => a + b, 0);
+    const order = amounts.map((a, i) => ({ i, r: (T * BigInt(a)) % BA })).sort((x, y) => (y.r > x.r ? 1 : y.r < x.r ? -1 : x.i - y.i));
+    for (let k = 0; left > 0; k = (k + 1) % order.length, left--) base[order[k].i] += 1;
+    return base;
+  }
+
+  // 外币账：先按原币分摊（origCents 总额），再把人民币总额 cnyCents 按各人原币份额折算。
+  // 返回 [{memberId, weight, fixed, origCents, cents}]，fixed 是原币指定金额
+  function splitExpense(origCents, cnyCents, parts) {
+    const orig = computeShares(origCents, parts);
+    const cny = distribute(cnyCents, orig.map((s) => s.cents));
+    return orig.map((s, i) => ({ memberId: s.memberId, weight: s.weight, fixed: s.fixed, origCents: s.cents, cents: cny[i] }));
+  }
+
   function shareError(msg) { const e = new Error(msg); e.status = 400; return e; }
 
   // 结算：每人净额 = 垫付 - 应摊 + 已转出 - 已收到（正数=别人还欠他，负数=他还要给别人）。
@@ -61,5 +81,5 @@
     return { balances, transfers };
   }
 
-  return { computeShares, settle };
+  return { computeShares, distribute, splitExpense, settle };
 });

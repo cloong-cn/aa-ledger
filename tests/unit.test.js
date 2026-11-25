@@ -40,5 +40,16 @@ for (let i = 0; i < 500; i++) {
   if (a.transfers.length > n - 1 || b.balances.some((x) => x.net !== 0)) { fail++; console.log('✗ 随机结算', JSON.stringify(exps)); break; }
 }
 pass++;
+// 多币种：按原币份额折算人民币，总和不差一分
+const { splitExpense, distribute } = require('../public/settle');
+eq('日元三人分', splitExpense(300000, 14246, [1, 2, 3].map((id) => ({ memberId: id, weight: 1, fixed: null }))).map((x) => x.cents), [4749, 4749, 4748]);
+eq('大数不溢出', distribute(999999999, [999999999, 1, 1]), [999999997, 1, 1]);
+eq('全 0 份额', distribute(100, [0, 0]), [100, 0]);
+for (let i = 0; i < 2000; i++) {
+  const n = 1 + Math.floor(Math.random() * 8), o = 1 + Math.floor(Math.random() * 1e9), c = 1 + Math.floor(Math.random() * 1e8);
+  const r = splitExpense(o, c, Array.from({ length: n }, (_, k) => ({ memberId: k + 1, weight: 1 + (k % 3), fixed: null })));
+  if (r.reduce((a, x) => a + x.cents, 0) !== c || r.reduce((a, x) => a + x.origCents, 0) !== o) { fail++; console.log('✗ 折算求和', o, c); break; }
+}
+pass++;
 console.log(`算法测试：通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

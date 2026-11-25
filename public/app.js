@@ -1,7 +1,7 @@
 'use strict';
 // AA 账本前端：无框架。/ = 管理员首页，/t/<key> = 某次游玩（凭分享链接）
 const $app = document.getElementById('app');
-const { computeShares } = window.AASettle;
+const { computeShares, splitExpense } = window.AASettle;
 
 const CATS = [
   { key: 'food', name: '餐饮', icon: '🍜' },
@@ -13,6 +13,19 @@ const CATS = [
   { key: 'other', name: '其他', icon: '📦' },
 ];
 const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
+// 币种（顺序即选择顺序）。结算统一折算成人民币
+const CURS = [
+  { key: 'CNY', name: '人民币', short: '人民币', sym: '¥' },
+  { key: 'HKD', name: '港币', short: '港币', sym: 'HK$' },
+  { key: 'TWD', name: '新台币', short: '新台币', sym: 'NT$' },
+  { key: 'JPY', name: '日元', short: '日元', sym: 'JP¥' },
+  { key: 'SGD', name: '新加坡元', short: '新币', sym: 'S$' },
+  { key: 'MYR', name: '马来西亚令吉', short: '马币', sym: 'RM' },
+  { key: 'AUD', name: '澳元', short: '澳元', sym: 'A$' },
+  { key: 'USD', name: '美元', short: '美元', sym: 'US$' },
+];
+const CUR = Object.fromEntries(CURS.map((c) => [c.key, c]));
+const fmtRate = (r) => String(Number(r.toPrecision(6)));
 const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
 // ---------- 工具 ----------
@@ -22,6 +35,8 @@ function money(c, { sign = false, cur = true } = {}) {
   const s = (a / 100).toFixed(a % 100 === 0 ? 0 : 2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return (neg ? '-' : sign && c > 0 ? '+' : '') + (cur ? '¥' : '') + s;
 }
+// 原币金额：人民币用 ¥，其他币种用各自符号
+const curMoney = (cur, c) => (!cur || cur === 'CNY' ? money(c) : CUR[cur].sym + money(c, { cur: false }));
 const amountInput = (c) => (c / 100).toFixed(c % 100 === 0 ? 0 : 2);
 const md = (day) => `${Number(day.slice(5, 7))}月${Number(day.slice(8))}日`;
 const wk = (day) => '周' + WEEK[new Date(day + 'T00:00:00Z').getUTCDay()];
@@ -411,7 +426,7 @@ function renderBills(body) {
     html += `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
-      const sub = `${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
+      const sub = `${e.currency !== 'CNY' ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
       html += `<button class="item" data-exp="${e.id}"><span class="cat">${CAT[e.category]?.icon || '📦'}</span>
         <span class="main"><span class="t">${esc(e.title || CAT[e.category]?.name || '其他')}</span><span class="s">${sub}</span></span>
         <span class="amt"><b class="num">${money(e.cents)}</b>${mineShare ? `<span class="num">我 ${money(mineShare.cents)}</span>` : S.me ? '<span>我不参与</span>' : ''}</span></button>`;
@@ -428,7 +443,8 @@ function expenseDetail(id) {
   const imgs = e.images.map((i) => `<button class="thumb" data-img="${i}"><img src="/api/t/${S.key}/images/${i}" alt="截图" loading="lazy"></button>`).join('');
   const mode = e.shares.some((s) => s.fixed != null) ? '含指定金额' : e.shares.every((s) => s.weight === e.shares[0].weight) ? '平均分' : '按份数';
   openSheet(`${sheetHead(e.title || CAT[e.category].name)}
-    <div style="font-size:32px;font-weight:700;margin:-6px 0 10px" class="num">${money(e.cents)}</div>
+    <div style="font-size:32px;font-weight:700;margin:-6px 0 ${e.currency !== 'CNY' ? 0 : 10}px" class="num">${curMoney(e.currency, e.origCents)}</div>
+    ${e.currency !== 'CNY' ? `<div class="muted num" style="margin:0 0 12px">≈ ${money(e.cents)} 人民币 · ${e.cnyOverride ? '按实付人民币' : `1 ${CUR[e.currency].name} = ${fmtRate(e.rate)}`}</div>` : ''}
     <div class="card">
       <div class="kv"><span>类别</span><span>${CAT[e.category]?.icon} ${CAT[e.category]?.name}</span></div>
       <div class="kv"><span>日期</span><span>${md(e.day)} ${wk(e.day)}</span></div>
@@ -436,7 +452,7 @@ function expenseDetail(id) {
       <div class="kv"><span>怎么分</span><span>${e.shares.length} 人 · ${mode}</span></div>
     </div>
     <div class="card"><h2>每人分摊</h2>
-      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${money(s.cents)}</span></div>`).join('')}
+      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== 'CNY' ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
     </div>
     ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
@@ -458,7 +474,9 @@ function expenseForm(exp) {
   const d = T();
   if (!d.members.length) { toast('先在「成员」里加人', true); S.tab = 'people'; return renderTrip(); }
   const f = {
-    amount: exp ? amountInput(exp.cents) : '',
+    amount: exp ? amountInput(exp.origCents) : '',
+    currency: exp?.currency || store.get('aa:cur:' + S.key) || 'CNY',
+    cny: exp?.cnyOverride ? amountInput(exp.cents) : '',
     title: exp?.title || '', note: exp?.note || '',
     category: exp?.category || 'food',
     payerId: exp?.payerId ?? S.me ?? d.members[0].id,
@@ -476,7 +494,9 @@ function expenseForm(exp) {
   let saving = false;
 
   openSheet(`${sheetHead(exp ? '修改这笔' : '记一笔')}
-    <div class="field amount-wrap"><input class="amount-input num" id="f-amount" inputmode="decimal" placeholder="0" value="${esc(f.amount)}" autocomplete="off"></div>
+    <div class="chips" id="f-cur" style="margin-bottom:10px"></div>
+    <div class="field amount-wrap cur"><span class="sym" id="f-sym"></span><input class="amount-input num" id="f-amount" inputmode="decimal" placeholder="0" value="${esc(f.amount)}" autocomplete="off"></div>
+    <div id="f-fx"></div>
     <div class="field"><input class="input" id="f-title" maxlength="40" placeholder="花在什么上？例如：晚饭火锅" value="${esc(f.title)}"></div>
     <div class="field"><div class="lab">类别</div><div class="chips" id="f-cat"></div></div>
     <div class="field"><div class="lab">谁付的钱</div><div class="chips" id="f-payer"></div></div>
@@ -491,6 +511,27 @@ function expenseForm(exp) {
     <div class="err" id="f-err"></div>
     <button class="btn primary block" id="f-save">${exp ? '保存修改' : '记下来'}</button>`, (el) => {
     const $ = (s) => el.querySelector(s);
+    const tripRate = () => (f.currency === 'CNY' ? 1 : d.rates[f.currency]?.rate);
+    const drawCur = () => {
+      $('#f-cur').innerHTML = CURS.map((c) => `<button type="button" class="chip small-chip ${f.currency === c.key ? 'on' : ''}" data-cur="${c.key}">${c.short}</button>`).join('');
+      $('#f-sym').textContent = CUR[f.currency].sym;
+      $('#f-amount').style.paddingLeft = (CUR[f.currency].sym.length * 15 + 12) + 'px';
+      const box = $('#f-fx');
+      if (f.currency === 'CNY') { box.innerHTML = ''; return preview(); }
+      const tr = tripRate(), live = d.fx?.rates?.[f.currency];
+      const name = CUR[f.currency].name;
+      box.innerHTML = `<div class="fx-box">
+        ${tr ? `<div class="small">汇率：1 ${name} = <b>${fmtRate(tr)}</b> 人民币 <span class="faint">· 本次游玩统一汇率，可在「成员」页修改</span></div>`
+          : `<div class="field" style="margin:0"><label>汇率（第一次用${name}，之后本次游玩都按这个算）</label>
+              <div class="row2" style="align-items:center"><span class="small" style="flex:none">1 ${name} =</span><input class="input" id="f-rate" inputmode="decimal" value="${live ? fmtRate(live) : ''}" placeholder="例如 ${f.currency === 'JPY' ? '0.047' : '0.9'}"><span class="small" style="flex:none">人民币</span></div>
+              <div class="faint tiny" style="margin-top:4px">${live ? `已填入今日市场汇率${d.fx.at ? '（' + fmtTime(d.fx.at) + ' 更新）' : ''}，可以改成你们实际换汇的汇率` : '暂时拿不到市场汇率，请手动填写'}</div></div>`}
+        <div class="field" style="margin:10px 0 0"><label>实付人民币（可选）</label>
+          <input class="input" id="f-cny" inputmode="decimal" placeholder="刷卡的话填账单上的人民币金额，以它为准" value="${esc(f.cny)}"></div>
+      </div>`;
+      const ri = $('#f-rate'); if (ri) ri.oninput = preview;
+      $('#f-cny').oninput = (e) => { f.cny = e.target.value; preview(); };
+      preview();
+    };
     const drawCats = () => { $('#f-cat').innerHTML = CATS.map((c) => `<button type="button" class="chip ${f.category === c.key ? 'on' : ''}" data-c="${c.key}">${c.icon} ${c.name}</button>`).join(''); };
     const drawPayer = () => { $('#f-payer').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.payerId === m.id ? 'on' : ''}" data-p="${m.id}">${esc(m.name)}</button>`).join(''); };
     const drawWho = () => {
@@ -506,14 +547,30 @@ function expenseForm(exp) {
         const p = f.parts.get(m.id);
         return `<div class="split-row" data-row="${m.id}"><span class="n">${esc(m.name)}</span>
           <input data-k="weight" inputmode="decimal" value="${esc(p.weight)}" aria-label="${esc(m.name)}的份数" ${p.fixed !== '' ? 'disabled' : ''}><span class="faint small">份</span>
-          <input class="money" data-k="fixed" inputmode="decimal" placeholder="或金额" value="${esc(p.fixed)}" aria-label="${esc(m.name)}的指定金额">
+          <input class="money" data-k="fixed" inputmode="decimal" placeholder="${f.currency === 'CNY' ? '或金额' : '或' + CUR[f.currency].sym}" value="${esc(p.fixed)}" aria-label="${esc(m.name)}的指定金额">
           <span class="r num" data-r></span></div>`;
       }).join('')}</div><p class="faint tiny" style="margin:6px 2px 0">填了金额的人按金额算，剩下的钱按份数分给其他人</p>` : '';
       preview();
     };
+    const curRate = () => {
+      if (f.currency === 'CNY') return 1;
+      const tr = tripRate(); if (tr) return tr;
+      const v = String($('#f-rate')?.value ?? '').trim();
+      return /^\d{1,4}(\.\d{1,8})?$/.test(v) && Number(v) > 0 ? Number(v) : null;
+    };
     const calc = () => {
       const cents = parseCents($('#f-amount').value);
       if (!cents || !f.parts.size) return { cents, shares: null };
+      let cny;
+      if (f.currency !== 'CNY' && String(f.cny).trim() !== '') {
+        cny = parseCents(f.cny);
+        if (!cny) return { cents, error: '实付人民币金额不对' };
+      } else {
+        const rate = curRate();
+        if (!rate) return { cents, error: '请填写汇率' };
+        cny = Math.round(cents * rate);
+        if (cny < 1) return { cents, error: '折合人民币不足 1 分' };
+      }
       const parts = [];
       for (const [memberId, p] of f.parts) {
         if (f.detail && String(p.fixed).trim() !== '') {
@@ -526,7 +583,7 @@ function expenseForm(exp) {
           parts.push({ memberId, weight: w, fixed: null });
         }
       }
-      try { return { cents, parts, shares: computeShares(cents, parts) }; }
+      try { return { cents, cny, parts, shares: splitExpense(cents, cny, parts) }; }
       catch (e) { return { cents, error: e.message }; }
     };
     const preview = () => {
@@ -535,12 +592,15 @@ function expenseForm(exp) {
       el.querySelectorAll('[data-r]').forEach((x) => { x.textContent = ''; });
       if (r.error) { pv.innerHTML = `<span class="neg">${esc(r.error)}</span>`; return; }
       if (!r.shares) { pv.textContent = f.parts.size ? '' : '至少选一个人'; return; }
+      const foreign = f.currency !== 'CNY';
+      const one = (s) => foreign ? `${curMoney(f.currency, s.origCents)}（≈${money(s.cents)}）` : money(s.cents);
+      const head = foreign ? `折合人民币 <b>${money(r.cny)}</b>${String(f.cny).trim() ? '（按实付）' : ''}<br>` : '';
       if (f.detail) {
-        for (const s of r.shares) { const x = el.querySelector(`[data-row="${s.memberId}"] [data-r]`); if (x) x.textContent = money(s.cents); }
-        pv.textContent = '';
+        for (const s of r.shares) { const x = el.querySelector(`[data-row="${s.memberId}"] [data-r]`); if (x) x.textContent = foreign ? '≈' + money(s.cents) : money(s.cents); }
+        pv.innerHTML = head;
       } else {
-        const same = r.shares.every((s) => s.cents === r.shares[0].cents);
-        pv.textContent = same ? `${r.shares.length} 人平分，每人 ${money(r.shares[0].cents)}` : r.shares.map((s) => `${nameOf(s.memberId)} ${money(s.cents)}`).join(' · ');
+        const same = r.shares.every((s) => s.origCents === r.shares[0].origCents);
+        pv.innerHTML = head + esc(same ? `${r.shares.length} 人平分，每人 ${one(r.shares[0])}` : r.shares.map((s) => `${nameOf(s.memberId)} ${one(s)}`).join(' · '));
       }
     };
     const drawImgs = () => {
@@ -551,7 +611,8 @@ function expenseForm(exp) {
         + urls.map((u, i) => `<div class="thumb"><img src="${u}" alt="待上传" data-view="${u}"><button type="button" class="del" data-delnew="${i}" aria-label="移除">✕</button></div>`).join('')
         + (n < 9 ? '<button type="button" class="thumb add" id="f-addimg" aria-label="添加图片">＋</button>' : '');
     };
-    drawCats(); drawPayer(); drawWho(); drawImgs();
+    drawCats(); drawPayer(); drawWho(); drawImgs(); drawCur();
+    $('#f-cur').onclick = (e) => { const b = e.target.closest('[data-cur]'); if (b) { f.currency = b.dataset.cur; drawCur(); } };
 
     $('#f-amount').oninput = preview;
     $('#f-cat').onclick = (e) => { const b = e.target.closest('[data-c]'); if (b) { f.category = b.dataset.c; drawCats(); } };
@@ -609,9 +670,13 @@ function expenseForm(exp) {
       const payload = {
         amount: $('#f-amount').value.trim(), title: $('#f-title').value, note: $('#f-note').value,
         category: f.category, payerId: f.payerId, day: $('#f-day').value,
+        currency: f.currency,
+        rate: f.currency !== 'CNY' && !tripRate() ? $('#f-rate')?.value.trim() : undefined,
+        cny: f.currency !== 'CNY' ? String(f.cny).trim() || null : null,
         shares: r.parts.map((p) => ({ memberId: p.memberId, weight: p.fixed != null ? 1 : p.weight, fixed: p.fixed != null ? amountInput(p.fixed) : null })),
       };
       try {
+        store.set('aa:cur:' + S.key, f.currency);
         const res = exp ? await api('PUT', `/api/t/${S.key}/expenses/${exp.id}`, payload) : await api('POST', `/api/t/${S.key}/expenses`, payload);
         let failed = 0;
         for (let i = 0; i < newFiles.length; i++) {
@@ -686,7 +751,7 @@ function renderSettle(body) {
 function paidSheet(x) {
   openSheet(`${sheetHead('标记已转账')}
     <p style="margin-top:-4px"><b>${esc(nameOf(x.fromId))}</b> 已经转给 <b>${esc(nameOf(x.toId))}</b></p>
-    <div class="field amount-wrap"><input class="amount-input num" id="pd-amt" inputmode="decimal" value="${amountInput(x.cents)}"></div>
+    <div class="field amount-wrap"><span class="sym">¥</span><input class="amount-input num" id="pd-amt" inputmode="decimal" value="${amountInput(x.cents)}"></div>
     <p class="faint small">只转了一部分也可以改金额。</p>
     <div class="err"></div>
     <button class="btn primary block" id="pd-ok">确认已转</button>`, (el) => {
@@ -752,8 +817,10 @@ function drawPoster() {
   const total = d.expenses.reduce((a, e) => a + e.cents, 0);
   const rows = d.balances.filter((b) => member(b.memberId));
   const cats = CATS.map((c) => ({ ...c, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents > 0).sort((a, b) => b.cents - a.cents);
+  const usedCurs = [...new Set(d.expenses.map((e) => e.currency))].filter((c) => c !== 'CNY' && d.rates[c]);
+  const rateLine = usedCurs.length ? '汇率：' + usedCurs.map((c) => `1 ${CUR[c].name}=${fmtRate(d.rates[c].rate)}`).join('，') : '';
   // 先算高度
-  const H = 22 + 128 + 18 + (44 + rows.length * 34 + 12) + 18
+  const H = (rateLine ? 20 : 0) + 22 + 128 + 18 + (44 + rows.length * 34 + 12) + 18
     + (44 + Math.max(1, d.transfers.length) * 34 + (d.payments.length ? 30 + d.payments.length * 26 : 0) + 12) + 18
     + (cats.length ? 44 + Math.ceil(cats.length / 2) * 28 + 12 + 18 : 0) + 40;
   const c = document.createElement('canvas');
@@ -834,7 +901,8 @@ function drawPoster() {
     });
     y += h + 18;
   }
-  text(`AA 账本 · 生成于 ${fmtTime(Date.now())}`, W / 2, y + 12, { size: 11.5, color: C.faint, align: 'center' });
+  if (rateLine) { text(rateLine, W / 2, y + 12, { size: 11.5, color: C.muted, align: 'center', max: W - 2 * P }); y += 20; }
+  text(`AA 账本 · 金额均为人民币 · 生成于 ${fmtTime(Date.now())}`, W / 2, y + 12, { size: 11.5, color: C.faint, align: 'center' });
   return c;
 }
 
@@ -888,6 +956,13 @@ function renderStats(body) {
   // 类别
   const cats = CATS.map((c) => ({ key: c.key, cents: d.expenses.filter((e) => e.category === c.key).reduce((a, e) => a + e.cents, 0) })).filter((c) => c.cents).sort((a, b) => b.cents - a.cents);
   html += `<div class="card"><h2>花在哪了</h2>${catBars(cats, total)}</div>`;
+  const byCur = CURS.map((c) => {
+    const list = d.expenses.filter((e) => e.currency === c.key);
+    return { c, n: list.length, orig: list.reduce((a, e) => a + e.origCents, 0), cny: list.reduce((a, e) => a + e.cents, 0) };
+  }).filter((x) => x.n);
+  if (byCur.length > 1 || (byCur[0] && byCur[0].c.key !== 'CNY')) {
+    html += `<div class="card"><h2>按币种<span class="sp"></span><small>统一折算成人民币</small></h2>${byCur.map((x) => `<div class="kv"><span>${x.c.name} <span class="faint tiny">${x.n} 笔</span></span><span class="num">${x.c.key === 'CNY' ? money(x.cny) : `${curMoney(x.c.key, x.orig)} <span class="faint">≈${money(x.cny)}</span>`}</span></div>`).join('')}</div>`;
+  }
 
   // 每天
   if (span > 1 && span <= 31) {
@@ -902,7 +977,7 @@ function renderStats(body) {
 
   // 最大的几笔
   const top = d.expenses.slice().sort((a, b) => b.cents - a.cents).slice(0, 5);
-  html += `<div class="card"><h2>最大的 ${top.length} 笔</h2>${top.map((e) => `<div class="kv" data-exp="${e.id}" style="cursor:pointer"><span>${CAT[e.category]?.icon} ${esc(e.title || CAT[e.category]?.name)} <span class="faint tiny">${md(e.day)} · ${esc(nameOf(e.payerId))} 付</span></span><span class="num">${money(e.cents)}</span></div>`).join('')}</div>`;
+  html += `<div class="card"><h2>最大的 ${top.length} 笔</h2>${top.map((e) => `<div class="kv" data-exp="${e.id}" style="cursor:pointer"><span>${CAT[e.category]?.icon} ${esc(e.title || CAT[e.category]?.name)} <span class="faint tiny">${md(e.day)} · ${esc(nameOf(e.payerId))} 付${e.currency !== 'CNY' ? ' · ' + esc(curMoney(e.currency, e.origCents)) : ''}</span></span><span class="num">${money(e.cents)}</span></div>`).join('')}</div>`;
 
   // 谁垫钱最多
   const payer = rows.slice().sort((a, b) => b.paid - a.paid)[0];
@@ -929,6 +1004,7 @@ function renderPeople(body) {
     <div class="list">
       <button class="item" id="pm-share"><span class="cat">🔗</span><span class="main"><span class="t">分享链接</span><span class="s">发到群里，大家打开就能记账</span></span></button>
       ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
+      ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} 人民币</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
       <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔</span></span></button>
       ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
     </div>
@@ -953,6 +1029,7 @@ function renderPeople(body) {
   }
   body.querySelector('#pm-share').onclick = () => shareLink(false);
   body.querySelector('#pm-log').onclick = logSheet;
+  if (ed) body.querySelectorAll('[data-rate]').forEach((b) => b.onclick = () => rateSheet(b.dataset.rate));
   const pe = body.querySelector('#pm-edit'); if (pe) pe.onclick = tripEditSheet;
   const pl = body.querySelector('#pm-lock'); if (pl) pl.onclick = lockTrip;
   const pu = body.querySelector('#pa-unlock');
@@ -969,6 +1046,22 @@ function renderPeople(body) {
     try { await api('DELETE', `/api/admin/trips/${t.id}`); toast('已删除'); go('/'); }
     catch (e) { toast(e.message, true); }
   };
+}
+
+function rateSheet(cur) {
+  const d = T(), r = d.rates[cur], live = d.fx?.rates?.[cur], name = CUR[cur].name;
+  const n = d.expenses.filter((e) => e.currency === cur && !e.cnyOverride).length;
+  openSheet(`${sheetHead(`${name}汇率`)}
+    <div class="row2" style="align-items:center"><span style="flex:none">1 ${name} =</span><input class="input" id="rt-v" inputmode="decimal" value="${fmtRate(r.rate)}"><span style="flex:none">人民币</span></div>
+    ${live ? `<button class="btn ghost small" id="rt-live" style="margin-top:6px">用今日市场汇率 ${fmtRate(live)}</button>` : ''}
+    <p class="muted small">保存后，本次游玩里 ${n} 笔${name}账目会按新汇率重新折算（填了「实付人民币」的不受影响）。已标记的转账不会变，结算方案会自动更新。</p>
+    <div class="err"></div><button class="btn primary block" id="rt-save">保存并重算</button>`, (el) => {
+    const lv = el.querySelector('#rt-live'); if (lv) lv.onclick = () => { el.querySelector('#rt-v').value = fmtRate(live); };
+    el.querySelector('#rt-save').onclick = async () => {
+      try { const x = await api('PUT', `/api/t/${S.key}/rates/${cur}`, { rate: el.querySelector('#rt-v').value.trim() }); closeSheet(); toast(`已更新，重算了 ${x.recomputed} 笔`); await refresh(); }
+      catch (e) { el.querySelector('.err').textContent = e.message; }
+    };
+  });
 }
 
 function shareLink(fresh) {

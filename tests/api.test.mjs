@@ -129,6 +129,46 @@ r = await call('POST', `/api/t/${key}/unlock`, {}); ok('管理员解锁', r.stat
 r = await call('GET', '/api/admin/stats?year=2026'); ok('年度统计', r.status === 200 && r.data.trips.some((t) => t.id === tripId));
 r = await call('GET', '/api/admin/people'); ok('常用人名', r.data.people.includes('zz甲'));
 
+// ===== 多币种 =====
+r = await call('GET', '/api/fx'); ok('市场汇率', r.status === 200 && r.data.rates.JPY > 0, JSON.stringify(r.data));
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '3000', currency: 'JPY', rate: '0.05', title: '拉面', category: 'food', payerId: A, day: '2026-11-21',
+  shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: A });
+ok('日元记账', r.status === 200, JSON.stringify(r.data)); const J1 = r.data.id;
+r = await call('GET', `/api/t/${key}`);
+let j1 = r.data.expenses.find((e) => e.id === J1);
+ok('日元折算 3000×0.05=150', j1.cents === 15000 && j1.origCents === 300000 && j1.currency === 'JPY' && r.data.rates.JPY.rate === 0.05, JSON.stringify(j1));
+ok('日元分摊', JSON.stringify(j1.shares.map((s) => [s.origCents, s.cents])) === '[[100000,5000],[100000,5000],[100000,5000]]');
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '1000', currency: 'JPY', rate: '9', payerId: B,
+  shares: [{ memberId: A, fixed: '100' }, { memberId: B, weight: 1 }, { memberId: C, weight: 1 }] });
+const J2 = r.data.id;
+r = await call('GET', `/api/t/${key}`); let j2 = r.data.expenses.find((e) => e.id === J2);
+ok('第二笔沿用本次汇率（忽略新传的）', j2.cents === 5000 && j2.rate === 0.05, JSON.stringify(j2));
+ok('外币指定金额按原币', JSON.stringify(j2.shares.map((s) => [s.origCents, s.cents])) === '[[10000,500],[45000,2250],[45000,2250]]', JSON.stringify(j2.shares));
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '500', currency: 'HKD', cny: '470.12', payerId: C, shares: [A, B, C].map((id) => ({ memberId: id })) });
+const H1 = r.data.id;
+r = await call('GET', `/api/t/${key}`); let h1 = r.data.expenses.find((e) => e.id === H1);
+ok('实付人民币', h1.cents === 47012 && h1.cnyOverride && h1.shares.reduce((a, s) => a + s.cents, 0) === 47012, JSON.stringify(h1));
+ok('港币首次自动用市场汇率', r.data.rates.HKD?.rate > 0);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', currency: 'USD', rate: 'abc', payerId: A, shares: [{ memberId: A }] }); ok('非法汇率被拒', r.status === 400);
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '1', currency: 'JPY', payerId: A, shares: [{ memberId: A }] });
+r2: { const t = await call('GET', `/api/t/${key}`); ok('1 日元 = 5 分', t.data.expenses.find((e) => e.id === r.data.id)?.cents === 5); }
+r = await call('POST', `/api/t/${key}/expenses`, { amount: '10', currency: 'XXX', payerId: A, shares: [{ memberId: A }] });
+r2b: { const t = await call('GET', `/api/t/${key}`); ok('未知币种按人民币', t.data.expenses.find((e) => e.id === r.data.id)?.currency === 'CNY'); }
+// 改汇率 → 重算
+r = await call('PUT', `/api/t/${key}/rates/JPY`, { rate: '0.048' }, { actor: A }); ok('改汇率', r.status === 200 && r.data.recomputed === 3, JSON.stringify(r.data));
+r = await call('GET', `/api/t/${key}`); j1 = r.data.expenses.find((e) => e.id === J1); j2 = r.data.expenses.find((e) => e.id === J2);
+ok('改汇率后重算', j1.cents === 14400 && j2.cents === 4800 && JSON.stringify(j2.shares.map((s) => s.cents)) === '[480,2160,2160]', JSON.stringify([j1.cents, j2.shares]));
+ok('重算后净额合计仍为 0', r.data.balances.reduce((a, b) => a + b.net, 0) === 0);
+h1 = r.data.expenses.find((e) => e.id === H1);
+r = await call('PUT', `/api/t/${key}/rates/HKD`, { rate: '2' }); r = await call('GET', `/api/t/${key}`);
+ok('实付人民币不受汇率影响', r.data.expenses.find((e) => e.id === H1).cents === 47012);
+r = await call('PUT', `/api/t/${key}/rates/CNY`, { rate: '2' }); ok('人民币汇率不能改', r.status === 400);
+r = await call('PUT', `/api/t/${key}/rates/JPY`, { rate: '0' }); ok('汇率 0 被拒', r.status === 400);
+// 外币改回人民币
+r = await call('PUT', `/api/t/${key}/expenses/${J2}`, { amount: '50', currency: 'CNY', payerId: B, shares: [A, B].map((id) => ({ memberId: id })) });
+r = await call('GET', `/api/t/${key}`); j2 = r.data.expenses.find((e) => e.id === J2);
+ok('外币改回人民币', j2.currency === 'CNY' && j2.cents === 5000 && j2.origCents === 5000 && j2.rate === 1);
+
 // 操作记录
 r = await call('GET', `/api/t/${key}/log`);
 ok('操作记录', r.data.items.some((i) => i.actor === 'zz乙' && /修改了一笔/.test(i.detail)) && r.data.items.some((i) => /锁定/.test(i.detail)));

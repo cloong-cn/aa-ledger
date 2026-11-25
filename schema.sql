@@ -109,3 +109,30 @@ CREATE TABLE IF NOT EXISTS audit (
   detail  text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_trip ON audit(trip_id, id);
+
+-- ===== v2：多币种。结算统一用人民币（cents 一律是人民币分） =====
+-- orig_cents = 原币金额（×100），rate = 1 单位原币折合多少人民币；cny_override = 直接填了实付人民币（如刷卡账单），不按汇率算
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS currency text NOT NULL DEFAULT 'CNY';
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS orig_cents int;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS rate numeric(16,8) NOT NULL DEFAULT 1;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cny_override boolean NOT NULL DEFAULT false;
+UPDATE expenses SET orig_cents = cents WHERE orig_cents IS NULL;
+-- 每人分摊的原币金额；fixed_cents 是原币的指定金额
+ALTER TABLE expense_shares ADD COLUMN IF NOT EXISTS orig_cents int;
+UPDATE expense_shares SET orig_cents = cents WHERE orig_cents IS NULL;
+
+-- 每次游玩各币种的汇率（同一次游玩里同一币种用同一个汇率）
+CREATE TABLE IF NOT EXISTS trip_rates (
+  trip_id    int  NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  currency   text NOT NULL,
+  rate       numeric(16,8) NOT NULL CHECK (rate > 0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (trip_id, currency)
+);
+-- 市场参考汇率缓存
+CREATE TABLE IF NOT EXISTS fx_cache (
+  currency   text PRIMARY KEY,
+  rate       numeric(16,8) NOT NULL,
+  source_at  timestamptz,
+  fetched_at timestamptz NOT NULL DEFAULT now()
+);

@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
-const { settle, computeShares } = require('./public/settle');
+const { settle, splitExpense } = require('./public/settle');
 
 const PORT = Number(process.env.PORT || 8792);
 const HOST = '127.0.0.1';
@@ -46,6 +46,43 @@ function cleanText(v, max) {
   return String(v ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim().slice(0, max);
 }
 const CATEGORIES = { food: '餐饮', transport: '交通', lodging: '住宿', ticket: '门票', fun: '娱乐', shopping: '购物', other: '其他' };
+// 支持的币种。结算统一折算成人民币
+const CURRENCIES = {
+  CNY: { name: '人民币', sym: '¥' }, HKD: { name: '港币', sym: 'HK$' }, TWD: { name: '新台币', sym: 'NT$' },
+  JPY: { name: '日元', sym: 'JP¥' }, SGD: { name: '新加坡元', sym: 'S$' }, MYR: { name: '马来西亚令吉', sym: 'RM' },
+  AUD: { name: '澳元', sym: 'A$' }, USD: { name: '美元', sym: 'US$' },
+};
+// 市场参考汇率（open.er-api.com，免费、无需密钥，每天更新）。缓存 6 小时，拿不到就用旧的
+let fxPending = null;
+async function cachedRates() {
+  const { rows } = await db.query(`SELECT currency, rate::float AS rate, source_at, fetched_at FROM fx_cache`);
+  return {
+    rates: Object.fromEntries(rows.map((r) => [r.currency, r.rate])),
+    at: rows.reduce((a, r) => (!a || r.source_at > a ? r.source_at : a), null),
+    stale: !rows.length || rows.some((r) => Date.now() - new Date(r.fetched_at) > 6 * 3600e3),
+  };
+}
+async function refreshRates() {
+  try {
+    const res = await fetch('https://open.er-api.com/v6/latest/CNY', { signal: AbortSignal.timeout(5000) });
+    const d = await res.json();
+    if (d.result !== 'success') throw new Error('fx ' + d.result);
+    const at = new Date(d.time_last_update_unix * 1000);
+    for (const cur of Object.keys(CURRENCIES)) {
+      if (cur === 'CNY' || !(d.rates[cur] > 0)) continue;
+      await db.query(`INSERT INTO fx_cache(currency,rate,source_at,fetched_at) VALUES($1,$2,$3,now())
+        ON CONFLICT (currency) DO UPDATE SET rate=EXCLUDED.rate, source_at=EXCLUDED.source_at, fetched_at=now()`,
+        [cur, Number((1 / d.rates[cur]).toFixed(8)), at]);
+    }
+  } catch (e) { console.error('拿汇率失败：', e.message); }
+}
+async function liveRates() {
+  const c = await cachedRates();
+  if (!c.stale) return { rates: c.rates, at: c.at };
+  await (fxPending ||= refreshRates().finally(() => { fxPending = null; }));
+  const n = await cachedRates();
+  return { rates: n.rates, at: n.at };
+}
 const fmtY = (c) => '¥' + (c / 100).toFixed(c % 100 ? 2 : 0);
 const newKey = () => crypto.randomBytes(16).toString('base64url'); // 22 位
 
@@ -123,7 +160,7 @@ function route(method, pattern, handler, opts = {}) {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => {
     keys.push(k);
-    return k === 'key' ? '([A-Za-z0-9_-]{16,32})' : k === 'kind' ? '(wechat|alipay)' : '(\\d{1,9})';
+    return k === 'key' ? '([A-Za-z0-9_-]{16,32})' : k === 'kind' ? '(wechat|alipay)' : k === 'cur' ? '([A-Z]{3})' : '(\\d{1,9})';
   }) + '$');
   routes.push({ method, re, keys, handler, auth: opts.auth || 'none', raw: !!opts.raw });
 }
@@ -175,19 +212,20 @@ async function loadTrip(key) {
 function assertOpen(trip) { if (trip.locked) throw new HttpError(423, '账单已锁定，不能再修改'); }
 
 async function tripPayload(trip, admin) {
-  const [{ rows: members }, { rows: exps }, { rows: shares }, { rows: imgs }, { rows: pays }, { rows: codes }] = await Promise.all([
+  const [{ rows: members }, { rows: exps }, { rows: shares }, { rows: imgs }, { rows: pays }, { rows: codes }, { rows: rates }] = await Promise.all([
     db.query(`SELECT m.id, m.person_id, p.name, m.weight::float AS weight FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 ORDER BY m.id`, [trip.id]),
-    db.query(`SELECT id, payer_id, cents, category, title, note, to_char(day,'YYYY-MM-DD') AS day, created_by, created_at, updated_at FROM expenses WHERE trip_id=$1 ORDER BY day DESC, id DESC`, [trip.id]),
-    db.query(`SELECT s.expense_id, s.member_id, s.weight::float AS weight, s.fixed_cents, s.cents FROM expense_shares s JOIN expenses e ON e.id=s.expense_id WHERE e.trip_id=$1 ORDER BY s.member_id`, [trip.id]),
+    db.query(`SELECT id, payer_id, cents, currency, orig_cents, rate::float AS rate, cny_override, category, title, note, to_char(day,'YYYY-MM-DD') AS day, created_by, created_at, updated_at FROM expenses WHERE trip_id=$1 ORDER BY day DESC, id DESC`, [trip.id]),
+    db.query(`SELECT s.expense_id, s.member_id, s.weight::float AS weight, s.fixed_cents, s.orig_cents, s.cents FROM expense_shares s JOIN expenses e ON e.id=s.expense_id WHERE e.trip_id=$1 ORDER BY s.member_id`, [trip.id]),
     db.query(`SELECT i.id, i.expense_id FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1 ORDER BY i.id`, [trip.id]),
     db.query(`SELECT id, from_id, to_id, cents, created_by, created_at FROM payments WHERE trip_id=$1 ORDER BY id`, [trip.id]),
     db.query(`SELECT c.person_id, c.kind, c.updated_at FROM pay_codes c JOIN members m ON m.person_id=c.person_id WHERE m.trip_id=$1`, [trip.id]),
+    db.query(`SELECT currency, rate::float AS rate, updated_at FROM trip_rates WHERE trip_id=$1`, [trip.id]),
   ]);
   const byExp = new Map(exps.map((e) => [e.id, { shares: [], images: [] }]));
-  for (const s of shares) byExp.get(s.expense_id)?.shares.push({ memberId: s.member_id, weight: s.weight, fixed: s.fixed_cents, cents: s.cents });
+  for (const s of shares) byExp.get(s.expense_id)?.shares.push({ memberId: s.member_id, weight: s.weight, fixed: s.fixed_cents, origCents: s.orig_cents, cents: s.cents });
   for (const i of imgs) byExp.get(i.expense_id)?.images.push(i.id);
   const expenses = exps.map((e) => ({
-    id: e.id, payerId: e.payer_id, cents: e.cents, category: e.category, title: e.title, note: e.note, day: e.day,
+    id: e.id, payerId: e.payer_id, cents: e.cents, currency: e.currency, origCents: e.orig_cents, rate: e.rate, cnyOverride: e.cny_override, category: e.category, title: e.title, note: e.note, day: e.day,
     createdBy: e.created_by, createdAt: e.created_at, updatedAt: e.updated_at, ...byExp.get(e.id),
   }));
   const payments = pays.map((p) => ({ id: p.id, fromId: p.from_id, toId: p.to_id, cents: p.cents, createdBy: p.created_by, createdAt: p.created_at }));
@@ -198,6 +236,8 @@ async function tripPayload(trip, admin) {
     trip: { id: trip.id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at },
     members: members.map((m) => ({ id: m.id, name: m.name, weight: m.weight, codes: codeMap[m.person_id] || {} })),
     expenses, payments, balances, transfers,
+    rates: Object.fromEntries(rates.map((r) => [r.currency, { rate: r.rate, updatedAt: r.updated_at }])),
+    fx: await liveRates(), currencies: CURRENCIES,
     isAdmin: !!admin, today: todayStr(), categories: CATEGORIES,
   };
 }
@@ -333,9 +373,12 @@ route('GET', '/api/t/:key/paycode/:id/:kind', async ({ params }) => {
 
 // ---------- 账目 ----------
 // 校验并算出每人分摊。返回 { payer, cents, category, title, note, day, shares:[{memberId,weight,fixed,cents}] }
-function parseExpense(body, mm, today) {
-  const cents = parseAmount(body.amount);
-  if (!cents) throw bad('金额不对（最多两位小数）');
+// 校验并算出每人分摊。rate = 1 单位原币折合多少人民币（人民币为 1）
+// 返回 { payer, currency, origCents, rate, cnyOverride, cents, category, title, note, day, shares }
+function parseExpense(body, mm, today, rate) {
+  const currency = CURRENCIES[body.currency] ? body.currency : 'CNY';
+  const origCents = parseAmount(body.amount);
+  if (!origCents) throw bad('金额不对（最多两位小数）');
   const payer = mm.get(Number(body.payerId));
   if (!payer) throw bad('请选择谁付的钱');
   const category = CATEGORIES[body.category] ? body.category : 'other';
@@ -345,6 +388,16 @@ function parseExpense(body, mm, today) {
   if (!validDay(day)) throw bad('日期不对');
   if (!Array.isArray(body.shares) || !body.shares.length) throw bad('至少选一个人分摊');
   if (body.shares.length > 50) throw bad('分摊的人太多了');
+  // 外币可以直接填"实付人民币"（如信用卡账单金额），这时不按汇率算
+  let cents, cnyOverride = false;
+  if (currency !== 'CNY' && body.cny != null && String(body.cny).trim() !== '') {
+    cents = parseAmount(body.cny);
+    if (!cents) throw bad('实付人民币金额不对');
+    cnyOverride = true;
+  } else {
+    cents = Math.round(origCents * rate);
+    if (cents < 1) throw bad('折合人民币不足 1 分');
+  }
   const seen = new Set();
   const parts = body.shares.map((s) => {
     const memberId = Number(s?.memberId);
@@ -361,24 +414,47 @@ function parseExpense(body, mm, today) {
     return { memberId, weight, fixed: null };
   });
   let shares;
-  try { shares = computeShares(cents, parts); } catch (e) { if (e.status === 400) throw bad(e.message); throw e; }
-  return { payer, cents, category, title, note, day, shares };
+  try { shares = splitExpense(origCents, cents, parts); } catch (e) { if (e.status === 400) throw bad(e.message); throw e; }
+  return { payer, currency, origCents, rate: cnyOverride ? origCents && cents / origCents : rate, cnyOverride, cents, category, title, note, day, shares };
 }
+const fmtMoney = (cur, c) => cur === 'CNY' ? fmtY(c) : `${CURRENCIES[cur].sym}${(c / 100).toFixed(c % 100 ? 2 : 0)}`;
 function describeExp(e, mm) {
-  return `${e.day.slice(5).replace('-', '/')} ${e.title || CATEGORIES[e.category]} ${fmtY(e.cents)}（${mm.get(e.payerId ?? e.payer.id)?.name ?? '?'} 付，${e.shares.length} 人分）`;
+  const amt = e.currency && e.currency !== 'CNY' ? `${fmtMoney(e.currency, e.origCents)}（≈${fmtY(e.cents)}）` : fmtY(e.cents);
+  return `${e.day.slice(5).replace('-', '/')} ${e.title || CATEGORIES[e.category]} ${amt}（${mm.get(e.payerId ?? e.payer.id)?.name ?? '?'} 付，${e.shares.length} 人分）`;
 }
 async function writeShares(q, expenseId, shares) {
   await q.query(`DELETE FROM expense_shares WHERE expense_id=$1`, [expenseId]);
   for (const s of shares) {
-    await q.query(`INSERT INTO expense_shares(expense_id,member_id,weight,fixed_cents,cents) VALUES($1,$2,$3,$4,$5)`,
-      [expenseId, s.memberId, s.weight, s.fixed, s.cents]);
+    await q.query(`INSERT INTO expense_shares(expense_id,member_id,weight,fixed_cents,orig_cents,cents) VALUES($1,$2,$3,$4,$5,$6)`,
+      [expenseId, s.memberId, s.weight, s.fixed, s.origCents, s.cents]);
   }
 }
 async function loadExpense(q, trip, id) {
-  const { rows: [e] } = await q.query(`SELECT id, payer_id AS "payerId", cents, category, title, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1 AND trip_id=$2`, [id, trip.id]);
+  const { rows: [e] } = await q.query(`SELECT id, payer_id AS "payerId", cents, currency, orig_cents AS "origCents", category, title, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1 AND trip_id=$2`, [id, trip.id]);
   if (!e) throw new HttpError(404, '这笔账不存在（可能已被删除）');
   e.shares = (await q.query(`SELECT member_id FROM expense_shares WHERE expense_id=$1`, [id])).rows;
   return e;
+}
+
+// 这次游玩某币种的汇率：已有就用已有的；第一次用到时用前端传来的（或市场汇率）并记下来
+const RATE_RE = /^\d{1,4}(\.\d{1,8})?$/;
+function parseRate(v) {
+  const s = String(v ?? '').trim();
+  if (!RATE_RE.test(s) || !(Number(s) > 0)) return null;
+  return Number(s);
+}
+async function tripRate(q, trip, currency, bodyRate, actor) {
+  if (currency === 'CNY' || !CURRENCIES[currency]) return 1;
+  const { rows: [r] } = await q.query(`SELECT rate::float AS rate FROM trip_rates WHERE trip_id=$1 AND currency=$2`, [trip.id, currency]);
+  if (r) return r.rate;
+  let rate = bodyRate != null && bodyRate !== '' ? parseRate(bodyRate) : null;
+  if (bodyRate != null && bodyRate !== '' && !rate) throw bad('汇率不对');
+  if (!rate) rate = (await liveRates()).rates[currency];
+  if (!rate) throw bad(`暂时拿不到${CURRENCIES[currency].name}汇率，请手动填写`);
+  rate = Number(rate.toFixed(8));
+  await q.query(`INSERT INTO trip_rates(trip_id,currency,rate) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, [trip.id, currency, rate]);
+  await log(q, trip.id, actor, 'rate.set', `设定汇率：1 ${CURRENCIES[currency].name} = ${rate} 人民币`);
+  return rate;
 }
 
 route('POST', '/api/t/:key/expenses', async ({ params, body, req, admin }) => {
@@ -386,10 +462,12 @@ route('POST', '/api/t/:key/expenses', async ({ params, body, req, admin }) => {
   assertOpen(trip);
   return tx(async (q) => {
     const mm = await memberMap(q, trip.id);
-    const e = parseExpense(body, mm, todayStr());
     const actor = await actorName(q, trip, req, admin);
-    const { rows: [r] } = await q.query(`INSERT INTO expenses(trip_id,payer_id,cents,category,title,note,day,created_by)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`, [trip.id, e.payer.id, e.cents, e.category, e.title, e.note, e.day, actor]);
+    const rate = await tripRate(q, trip, body.currency, body.rate, actor);
+    const e = parseExpense(body, mm, todayStr(), rate);
+    const { rows: [r] } = await q.query(`INSERT INTO expenses(trip_id,payer_id,cents,category,title,note,day,created_by,currency,orig_cents,rate,cny_override)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [trip.id, e.payer.id, e.cents, e.category, e.title, e.note, e.day, actor, e.currency, e.origCents, e.rate, e.cnyOverride]);
     await writeShares(q, r.id, e.shares);
     await log(q, trip.id, actor, 'expense.add', `记了一笔：${describeExp(e, mm)}`);
     return { id: r.id };
@@ -400,15 +478,46 @@ route('PUT', '/api/t/:key/expenses/:id', async ({ params, body, req, admin }) =>
   assertOpen(trip);
   return tx(async (q) => {
     const mm = await memberMap(q, trip.id);
+    const actor = await actorName(q, trip, req, admin);
     const old = await loadExpense(q, trip, params.id);
-    const e = parseExpense(body, mm, todayStr());
-    await q.query(`UPDATE expenses SET payer_id=$1,cents=$2,category=$3,title=$4,note=$5,day=$6,updated_at=now() WHERE id=$7`,
-      [e.payer.id, e.cents, e.category, e.title, e.note, e.day, old.id]);
+    const rate = await tripRate(q, trip, body.currency, body.rate, actor);
+    const e = parseExpense(body, mm, todayStr(), rate);
+    await q.query(`UPDATE expenses SET payer_id=$1,cents=$2,category=$3,title=$4,note=$5,day=$6,currency=$7,orig_cents=$8,rate=$9,cny_override=$10,updated_at=now() WHERE id=$11`,
+      [e.payer.id, e.cents, e.category, e.title, e.note, e.day, e.currency, e.origCents, e.rate, e.cnyOverride, old.id]);
     await writeShares(q, old.id, e.shares);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'expense.edit', `修改了一笔：${describeExp(old, mm)} → ${describeExp(e, mm)}`);
+    await log(q, trip.id, actor, 'expense.edit', `修改了一笔：${describeExp(old, mm)} → ${describeExp(e, mm)}`);
     return { id: old.id };
   });
 });
+
+// 修改这次游玩某币种的汇率：该币种所有（没填实付人民币的）账目按新汇率重算
+route('PUT', '/api/t/:key/rates/:cur', async ({ params, body, req, admin }) => {
+  const trip = await loadTrip(params.key);
+  assertOpen(trip);
+  const cur = params.cur;
+  if (!CURRENCIES[cur] || cur === 'CNY') throw bad('币种不对');
+  const rate = parseRate(body.rate);
+  if (!rate) throw bad('汇率不对');
+  return tx(async (q) => {
+    const { rows: [old] } = await q.query(`SELECT rate::float AS rate FROM trip_rates WHERE trip_id=$1 AND currency=$2`, [trip.id, cur]);
+    await q.query(`INSERT INTO trip_rates(trip_id,currency,rate,updated_at) VALUES($1,$2,$3,now())
+      ON CONFLICT (trip_id,currency) DO UPDATE SET rate=EXCLUDED.rate, updated_at=now()`, [trip.id, cur, rate]);
+    const { rows: exps } = await q.query(`SELECT id, orig_cents FROM expenses WHERE trip_id=$1 AND currency=$2 AND NOT cny_override`, [trip.id, cur]);
+    for (const e of exps) {
+      const cents = Math.max(1, Math.round(e.orig_cents * rate));
+      const { rows: sh } = await q.query(`SELECT member_id, weight::float AS weight, fixed_cents FROM expense_shares WHERE expense_id=$1 ORDER BY member_id`, [e.id]);
+      // 按原来的录入顺序无关紧要：分摊只取决于份数/指定金额
+      const shares = splitExpense(e.orig_cents, cents, sh.map((x) => ({ memberId: x.member_id, weight: x.fixed_cents != null ? 0 : x.weight, fixed: x.fixed_cents })));
+      await q.query(`UPDATE expenses SET cents=$1, rate=$2 WHERE id=$3`, [cents, rate, e.id]);
+      await writeShares(q, e.id, shares);
+    }
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'rate.edit',
+      `把汇率改为 1 ${CURRENCIES[cur].name} = ${rate} 人民币${old ? `（原 ${old.rate}）` : ''}，重算了 ${exps.length} 笔`);
+    return { ok: true, recomputed: exps.length };
+  });
+});
+route('GET', '/api/fx', async () => liveRates());
+
 route('DELETE', '/api/t/:key/expenses/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
@@ -656,7 +765,7 @@ const server = http.createServer(async (req, res) => {
     const r = routes.find((x) => x.method === req.method && x.re.test(url.pathname));
     if (!r) throw new HttpError(404, '接口不存在');
     const m = url.pathname.match(r.re);
-    const params = Object.fromEntries(r.keys.map((k, i) => [k, k === 'key' || k === 'kind' ? m[i + 1] : Number(m[i + 1])]));
+    const params = Object.fromEntries(r.keys.map((k, i) => [k, k === 'key' || k === 'kind' || k === 'cur' ? m[i + 1] : Number(m[i + 1])]));
     let body = {}, rawBody = null;
     if (r.raw) {
       if (!/^image\/(jpeg|png|webp)$/.test(String(req.headers['content-type'] || ''))) throw new HttpError(415, '只接受图片');
