@@ -66,7 +66,10 @@ async function api(method, url, body, { raw = false } = {}) {
   if (S.trip && S.me) headers['X-Actor'] = String(S.me);
   let payload;
   if (raw) { payload = body; headers['Content-Type'] = body.type; }
-  else if (body !== undefined) { payload = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
+  else if (body !== undefined || (method !== 'GET' && method !== 'DELETE')) {
+    // 写操作一律带 JSON（哪怕是空的 {}）：服务器只接受 application/json，没有 body 的 POST 会被拒（415）
+    payload = JSON.stringify(body ?? {}); headers['Content-Type'] = 'application/json';
+  }
   let res;
   try { res = await fetch(url, { method, headers, body: payload, credentials: 'same-origin' }); }
   catch { throw new Error('网络不通，请稍后再试'); }
