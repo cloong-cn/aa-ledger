@@ -216,6 +216,10 @@ git clone /srv/aa/backups/code-YYYYMMDD.bundle /srv/aa/app-restored
 - **仓库是公开的**：不要提交真实域名、服务器 IP、密码、`.env`、数据库导出、截图或任何真实账目数据（测试只用 zz 开头的假数据）。提交前可以跑 `git grep -nE '<真实域名>|<服务器IP>'` 检查一遍。
 
 - **分享链接 = 这次游玩的全部权限**。密钥是 128 位随机数。nginx 设了 `Referrer-Policy: same-origin`，避免链接通过 Referer 泄露，不要去掉。
+- **身份与权限**：游玩里的写操作必须先选「我是谁」（请求头 `X-Actor`），由 `server.js` 的 `identify()` 在进入接口前统一核对，结果放在 `req.actor`。例外：加入名单、输密码（路由带 `{ open: true }`）。管理员登录后不受限制。
+  - **成员密码**：可选的 4 位数字 PIN（`members.pin_hash`，scrypt）。输对后发一个凭证（`member_tokens`，只存 sha256），前端存在 `aa:tok:<行程>`，放在 `X-Actor-Token` 请求头里。连续输错 5 次锁 15 分钟。改密码 / 取消 / 管理员重置会让这个人所有凭证失效。
+  - **只有创建人能改**：改账、删账、给账加图、恢复删掉的账，只有记账人（`expenses.created_by`）和管理员能做；删图还允许传图的人；改图片备注是传图的人；撤销转账是标记的人；收款码只能本人或管理员上传 / 删除。规则在 `assertOwner()`。
+  - 身份按名字比对（同一次游玩里名字唯一）。`created_by` 是"未署名"或"管理员"的旧数据只有管理员能改。
 - **图片备注**：`images.note`（最多 200 字），看大图时底部可以加 / 改；只有传图的人（`images.created_by`，旧图按这笔账的记账人）和管理员能改，身份来自「我是谁」，属于防误改而不是严格权限。删除和恢复截图时备注跟着走。
 - **返回键**：打开弹窗 / 大图时会多压一条浏览器历史（`pushOverlay`），手机返回键只关最上面一层；用 ✕ 关时自动退掉这条历史。新增弹窗一律走 `openSheet` / `viewImage`，不要自己改 `hidden`。
 - **上传限制（防止把磁盘写满）**：网页上传前会先压缩（宽 ≤1200、高 ≤2800，转 JPEG）。服务器再兜底三道：单张最大 5MB（nginx `client_max_body_size 6m` + `server.js` 的 `MAX_IMAGE`）；每次游玩的截图总量（含最近删除）最多 100MB（环境变量 `TRIP_IMAGE_QUOTA_MB`）；磁盘剩余不足 2GB 时拒绝一切上传，返回 507（环境变量 `MIN_FREE_DISK_MB`）。

@@ -363,6 +363,7 @@ details > summary::before { content: "▸ "; }
 details[open] > summary::before { content: "▾ "; }
 .tag { white-space: nowrap; }
 #sheet .item.on { background: var(--accent-soft); }
+.pin-in { font-size: 28px; letter-spacing: .6em; text-align: center; padding-left: .6em; font-variant-numeric: tabular-nums; margin-bottom: 8px; }
 
 /* 管理员首页的数据安全状态行 */
 .health { display: block; width: 100%; text-align: left; margin: 0 0 12px; padding: 9px 12px; border-radius: 12px;

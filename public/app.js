@@ -103,7 +103,7 @@ function toast(msg, err = false) {
 
 async function api(method, url, body, { raw = false } = {}) {
   const headers = {};
-  if (S.trip && S.me) headers['X-Actor'] = String(S.me);
+  if (S.trip && S.me) { headers['X-Actor'] = String(S.me); const tk = myToken(); if (tk) headers['X-Actor-Token'] = tk; }
   let payload;
   if (raw) { payload = body; headers['Content-Type'] = body.type; }
   else if (body !== undefined || (method !== 'GET' && method !== 'DELETE')) {
@@ -114,7 +114,15 @@ async function api(method, url, body, { raw = false } = {}) {
   try { res = await fetch(url, { method, headers, body: payload, credentials: 'same-origin' }); }
   catch { throw new Error('网络不通，请稍后再试'); }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) { const e = new Error(data.error || `出错了（${res.status}）`); e.status = res.status; throw e; }
+  if (!res.ok) {
+    const e = new Error(data.error || `出错了（${res.status}）`); e.status = res.status; e.code = data.code;
+    // 没选「我是谁」/ 密码凭证失效（比如在别的手机上改了密码）：提示后弹出「我是谁」
+    if (S.trip && (data.code === 'who_required' || data.code === 'pin_required')) {
+      if (data.code === 'pin_required') setMe(null);
+      setTimeout(() => { renderTrip(); whoAmISheet(); }, 50);
+    }
+    throw e;
+  }
   return data;
 }
 
@@ -131,6 +139,7 @@ function popOverlay(kind) { if (history.state?.ov === kind) { popSkip++; history
 function openSheet(html, onMount) {
   if ($sheet.hidden || $sheet.classList.contains('closing')) { if (history.state?.ov !== 'sheet') pushOverlay('sheet'); }
   clearTimeout(closeTimer); $sheet.classList.remove('closing'); $back.classList.remove('closing');
+  $sheet._onClose = null;
   $sheet.innerHTML = `<div class="grab"></div>${html}`;
   $sheet.hidden = false; $back.hidden = false;
   document.body.style.overflow = 'hidden';
@@ -139,6 +148,7 @@ function openSheet(html, onMount) {
 }
 function closeSheet(fromPop = false) {
   if (!fromPop && !$sheet.hidden) popOverlay('sheet');
+  const cb = $sheet._onClose; $sheet._onClose = null; if (cb) cb();
   document.body.style.overflow = '';
   const done = () => { $sheet.hidden = true; $back.hidden = true; $sheet.innerHTML = ''; $sheet.classList.remove('closing'); $back.classList.remove('closing'); };
   clearTimeout(closeTimer);
@@ -700,7 +710,10 @@ async function loadTrip(first = false) {
     return;
   }
   const saved = Number(store.get('aa:me:' + S.key));
-  S.me = S.trip.members.some((m) => m.id === saved) ? saved : null;
+  const sm = S.trip.members.find((m) => m.id === saved);
+  S.me = sm ? saved : null;
+  // 这个人后来设了密码（或密码被重置过），这台手机还没输过：先当作没选
+  if (sm?.hasPin && !myToken()) S.me = null;
   renderTrip();
   if (first && !S.me && !store.get('aa:skip:' + S.key)) whoAmISheet();
 }
@@ -755,8 +768,15 @@ function renderTrip() {
     + `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}"><span class="i">${i}</span>${n}</button>`).join('')}</div></nav>`;
   document.getElementById('whoami').onclick = whoAmISheet;
   const fab = document.getElementById('fab');
-  if (fab) fab.onclick = () => expenseForm(null);
-  $app.querySelectorAll('[data-tab]').forEach((b) => b.onclick = () => { S.tab = b.dataset.tab; renderTrip(); window.scrollTo(0, 0); });
+  if (fab) fab.onclick = () => {
+    if (!S.me && !S.admin) { toast('先选一下你是谁'); return whoAmISheet(); }
+    expenseForm(null);
+  };
+  $app.querySelectorAll('[data-tab]').forEach((b) => b.onclick = () => {
+    // 已经在这个标签页：再点一下（双击也一样）平滑滚回顶部
+    if (S.tab === b.dataset.tab) return window.scrollTo({ top: 0, behavior: reduceMotion() ? 'auto' : 'smooth' });
+    S.tab = b.dataset.tab; renderTrip(); window.scrollTo(0, 0);
+  });
   const body = document.getElementById('tab-body');
   ({ bills: renderBills, settle: renderSettle, stats: renderStats, people: renderPeople })[S.tab](body);
 }
@@ -766,14 +786,13 @@ function whoAmISheet() {
   const d = T();
   openSheet(`${sheetHead('你是谁？')}
     <p class="muted small" style="margin-top:-6px">选一下，记账时默认是你付的钱，也方便大家看到是谁记的。只保存在这台手机上。</p>
-    <div class="chips" id="who-list">${d.members.map((m) => `<button class="chip ${m.id === S.me ? 'on' : ''}" data-id="${m.id}">${esc(m.name)}</button>`).join('')}</div>
+    <div class="chips" id="who-list">${d.members.map((m) => `<button class="chip ${m.id === S.me ? 'on' : ''}" data-id="${m.id}">${esc(m.name)}${m.hasPin ? ' 🔒' : ''}</button>`).join('')}</div>
     ${editable() ? `<div class="field" style="margin-top:16px"><label>名单里没有我</label>
       <div class="row2"><input class="input" id="who-new" maxlength="20" placeholder="输入你的名字"><button class="btn primary" id="who-add" style="flex:none">加入</button></div></div>` : ''}
     <button class="btn ghost block" id="who-skip" style="margin-top:6px">先随便看看</button>`, (el) => {
     el.querySelector('#who-list').onclick = (e) => {
       const b = e.target.closest('[data-id]'); if (!b) return;
-      S.me = Number(b.dataset.id); store.set('aa:me:' + S.key, String(S.me));
-      closeSheet(); renderTrip();
+      pickMe(Number(b.dataset.id));
     };
     el.querySelector('#who-skip').onclick = () => { store.set('aa:skip:' + S.key, '1'); closeSheet(); };
     const add = el.querySelector('#who-add');
@@ -782,11 +801,78 @@ function whoAmISheet() {
       if (!name) return;
       try {
         const r = await api('POST', `/api/t/${S.key}/members`, { name });
-        S.me = r.id; store.set('aa:me:' + S.key, String(r.id));
+        setMe(r.id, null);
         closeSheet(); toast(`欢迎，${name}`); await refresh();
+        offerPin();
       } catch (e) { toast(e.message, true); }
     };
   });
+}
+
+// ---------- 我是谁 / 成员密码 ----------
+// 设了密码的人，在一台新手机上选「我是谁」要输一次密码，换来的凭证存在这台手机上（aa:tok:<行程>），以后不用再输。
+const tokKey = () => 'aa:tok:' + S.key;
+function myToken() {
+  try { const t = JSON.parse(store.get(tokKey()) || 'null'); return t && t.id === S.me ? t.t : null; } catch { return null; }
+}
+function setMe(id, token) {
+  S.me = id;
+  store.set('aa:me:' + S.key, id ? String(id) : null);
+  if (token !== undefined) store.set(tokKey(), token ? JSON.stringify({ id, t: token }) : null);
+}
+// 只有记账人（创建人）和管理员能改；登录了管理员的手机都能改
+const canOwn = (owner) => !!S.admin || (!!S.me && !!owner && nameOf(S.me) === owner);
+// 输 4 位数字的弹窗。取消 / 关掉返回 null
+function pinSheet(title, text, err = '') {
+  return new Promise((resolve) => {
+    openSheet(`${sheetHead(title)}<p class="muted small" style="margin-top:-6px">${text}</p>
+      <form id="pin-f"><input class="input pin-in" name="pin" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="····" aria-label="4 位数字密码">
+      <div class="err">${esc(err)}</div><button class="btn primary block">确定</button></form>`, (el) => {
+      $sheet._onClose = () => resolve(null);
+      const inp = el.querySelector('.pin-in');
+      inp.oninput = () => { inp.value = inp.value.replace(/\D/g, '').slice(0, 4); if (inp.value.length === 4) el.querySelector('form').requestSubmit(); };
+      el.querySelector('form').onsubmit = (e) => {
+        e.preventDefault();
+        if (!/^\d{4}$/.test(inp.value)) { el.querySelector('.err').textContent = '要 4 位数字'; return; }
+        $sheet._onClose = null; resolve(inp.value); closeSheet();
+      };
+      setTimeout(() => inp.focus(), 250);
+    });
+  });
+}
+// 选「我是谁」：对方设了密码就要先输密码
+async function pickMe(id) {
+  const m = member(id); if (!m) return;
+  if (!m.hasPin) { setMe(id, null); closeSheet(); renderTrip(); return offerPin(); }
+  if (S.me === id && myToken()) { closeSheet(); return; }
+  let err = '';
+  for (;;) {
+    const pin = await pinSheet(`${m.name} 设了密码`, '输入 TA 的 4 位数字密码。这台手机输对一次以后就不用再输了。', err);
+    if (pin == null) return whoAmISheet();
+    try {
+      const r = await api('POST', `/api/t/${S.key}/members/${id}/claim`, { pin });
+      setMe(id, r.token); renderTrip(); toast(`你好，${m.name}`); return;
+    } catch (e) {
+      if (e.status !== 403) { toast(e.message, true); return whoAmISheet(); }
+      err = e.message;
+    }
+  }
+}
+// 刚选了自己、还没设密码：提示设一个（每次游玩只问一次）
+async function offerPin() {
+  const m = S.me && member(S.me);
+  if (!m || m.hasPin || store.get('aa:pinask:' + S.key)) return;
+  store.set('aa:pinask:' + S.key, '1');
+  if (!(await confirmSheet('给自己设个密码？', `设一个 4 位数字密码，别人就不能在他的手机上冒充「${esc(m.name)}」改账。你这台手机以后不用输。也可以以后在「成员」里设。`, '设置密码'))) return;
+  setPin();
+}
+async function setPin() {
+  const id = S.me; if (!id) return;
+  const a = await pinSheet('设置密码', '4 位数字，记住它：换手机或者清了浏览器数据时要用。'); if (a == null) return;
+  const b = await pinSheet('再输一次', '确认一下刚才的密码'); if (b == null) return;
+  if (a !== b) return toast('两次输入的不一样，再试一次', true);
+  try { const r = await api('PUT', `/api/t/${S.key}/members/${id}/pin`, { pin: a }); setMe(id, r.token); toast('密码已设置'); await refresh(); }
+  catch (e) { toast(e.message, true); }
 }
 
 // ---------- 账单 ----------
@@ -926,7 +1012,8 @@ function expenseDetail(id) {
     ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
     <p class="faint tiny" style="margin:14px 2px">${esc(e.createdBy || '未署名')} 记于 ${fmtTime(e.createdAt)}${e.updatedAt && new Date(e.updatedAt) - new Date(e.createdAt) > 2000 ? ` · 修改于 ${fmtTime(e.updatedAt)}` : ''}</p>
-    ${editable() ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>` : ''}`, (el) => {
+    ${editable() && canOwn(e.createdBy) ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>`
+      : editable() ? `<p class="faint small" style="text-align:center;margin:4px 0 0">这笔是「${esc(e.createdBy || '未署名')}」记的，只有 TA 和管理员能改</p>` : ''}`, (el) => {
     el.querySelectorAll('[data-img]').forEach((b, i) => b.onclick = () => viewImage(
       e.images.map((id) => ({ src: `/api/t/${S.key}/images/${id}`, id, note: notes[id] || '', canEdit: canNote(e, id) })), i,
       editable() ? { saveNote: async (id, note) => { await api('PATCH', `/api/t/${S.key}/images/${id}`, { note }); await refresh(); if (!$sheet.hidden) expenseDetail(e.id); return note; } } : {}));
@@ -1224,7 +1311,7 @@ function renderSettle(body) {
     <p class="faint tiny" style="margin:10px 0 0">垫付 = 替大家付的钱；应摊 = 自己该承担的部分；结果 = 垫付 − 应摊，再扣除「已转账」的金额${d.balances.some((b) => !Number.isInteger(b.share)) ? '。<br>有的账除不尽（比如 31.95 两人分，每人 15.975），应摊显示的是精确值，结果四舍五入到分' : ''}</p></div>`;
   if (d.payments.length) {
     html += `<div class="card"><h2>已转账</h2>${d.payments.slice().reverse().map((p) => `<div class="kv" data-pay="${p.id}"><span>✓ ${esc(nameOf(p.fromId))} → ${esc(nameOf(p.toId))} <span class="faint tiny">${fmtTime(p.createdAt)}</span></span>
-      <span class="num">${money(p.cents)}${editable() ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
+      <span class="num">${money(p.cents)}${editable() && canOwn(p.createdBy) ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
   }
   html += `<div class="btns" style="margin-top:4px"><button class="btn" id="poster">🖼️ 生成结算长图</button>${editable() && d.transfers.length ? '<button class="btn" id="lock">🔒 锁定账单</button>' : ''}</div>`;
   body.innerHTML = html;
@@ -1651,10 +1738,11 @@ function tripEditSheet() {
 function memberSheet(id) {
   const m = member(id); if (!m) return;
   const ed = editable();
+  const self = S.me === id && (!m.hasPin || !!myToken());
   const b = balOf(id);
   const codeRow = (k, n) => `<div class="kv" style="align-items:center"><span>${n}收款码</span><span>
     ${m.codes[k] ? `<button class="btn small" data-view="${k}">查看</button>` : '<span class="faint small">未上传</span>'}
-    ${ed ? `<button class="btn small" data-up="${k}">${m.codes[k] ? '更换' : '上传'}</button>${m.codes[k] ? `<button class="btn small danger" data-rm="${k}">删除</button>` : ''}` : ''}</span></div>`;
+    ${ed && (self || S.admin) ? `<button class="btn small" data-up="${k}">${m.codes[k] ? '更换' : '上传'}</button>${m.codes[k] ? `<button class="btn small danger" data-rm="${k}">删除</button>` : ''}` : ''}</span></div>`;
   openSheet(`${sheetHead(m.name)}
     <div class="card">
       <div class="kv"><span>垫付</span><span class="num">${money(b.paid)}</span></div>
@@ -1662,7 +1750,12 @@ function memberSheet(id) {
       <div class="kv"><span>结果</span><span class="num">${b.net > 0 ? `<span class="pos">应收 ${money(b.net)}</span>` : b.net < 0 ? `<span class="neg">应付 ${money(-b.net)}</span>` : '已结清'}</span></div>
     </div>
     <div class="card">${codeRow('wechat', '微信')}${codeRow('alipay', '支付宝')}
-      <p class="faint tiny" style="margin:8px 0 0">收款码跟着人走，以后的游玩也能直接用</p></div>
+      <p class="faint tiny" style="margin:8px 0 0">收款码跟着人走，以后的游玩也能直接用${self || S.admin ? '' : `；只有 ${esc(m.name)} 本人能上传`}</p></div>
+    ${self ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 密码${m.hasPin ? '<span class="tag">已设置</span>' : ''}</span><span>
+        <button class="btn small" id="ms-pin">${m.hasPin ? '修改' : '设置'}</button>${m.hasPin ? '<button class="btn small danger" id="ms-unpin">取消</button>' : ''}</span></div>
+        <p class="faint tiny" style="margin:8px 0 0">设了密码，别人就不能在他的手机上冒充你改账</p></div>`
+      : S.admin && m.hasPin ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 ${esc(m.name)} 设了密码</span><button class="btn small danger" id="ms-reset">重置</button></div>
+        <p class="faint tiny" style="margin:8px 0 0">TA 忘了密码时用。重置后 TA 选「我是谁」就不用输密码了，可以再设新的</p></div>` : ''}
     ${ed ? `<div class="card"><div class="field" style="margin:0"><label>默认份数（带家属可以填 2；记账时可以单独改）</label>
       <div class="row2"><input class="input" id="ms-w" inputmode="decimal" value="${m.weight}"><button class="btn" id="ms-save" style="flex:none">保存</button></div></div></div>
       <button class="btn danger block" id="ms-del">从这次游玩中移除</button>` : ''}
@@ -1691,12 +1784,26 @@ function memberSheet(id) {
       if (!(await confirmSheet(`移除 ${esc(m.name)}？`, '只有还没参与任何账目的人才能移除。', '移除', true))) return;
       try {
         await api('DELETE', `/api/t/${S.key}/members/${id}`);
-        if (S.me === id) { S.me = null; store.set('aa:me:' + S.key, null); }
+        if (S.me === id) setMe(null, null);
         toast('已移除'); await refresh();
       } catch (e) { toast(e.message, true); }
     };
     const mm = el.querySelector('#ms-me');
-    if (mm) mm.onclick = () => { S.me = id; store.set('aa:me:' + S.key, String(id)); closeSheet(); renderTrip(); };
+    if (mm) mm.onclick = () => pickMe(id);
+    const pp = el.querySelector('#ms-pin');
+    if (pp) pp.onclick = () => setPin();
+    const up = el.querySelector('#ms-unpin');
+    if (up) up.onclick = async () => {
+      if (!(await confirmSheet('取消密码？', '取消后，谁都可以在自己的手机上选你的名字。', '取消密码', true))) return;
+      try { await api('DELETE', `/api/t/${S.key}/members/${id}/pin`); setMe(id, null); toast('已取消密码'); await refresh(); }
+      catch (e) { toast(e.message, true); }
+    };
+    const rs = el.querySelector('#ms-reset');
+    if (rs) rs.onclick = async () => {
+      if (!(await confirmSheet(`重置 ${esc(m.name)} 的密码？`, 'TA 所有手机上记住的密码都会失效。', '重置', true))) return;
+      try { await api('DELETE', `/api/t/${S.key}/members/${id}/pin`); toast('已重置'); await refresh(); }
+      catch (e) { toast(e.message, true); }
+    };
   });
 }
 

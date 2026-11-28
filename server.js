@@ -121,7 +121,7 @@ function checkPassword(pw, stored) {
 }
 const DUMMY_HASH = hashPassword(crypto.randomBytes(8).toString('hex'));
 
-class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+class HttpError extends Error { constructor(status, msg, code) { super(msg); this.status = status; this.code = code; } }
 const bad = (msg) => new HttpError(400, msg);
 
 async function tx(fn) {
@@ -210,7 +210,7 @@ function route(method, pattern, handler, opts = {}) {
     keys.push(k);
     return k === 'key' ? '([A-Za-z0-9_-]{16,32})' : k === 'kind' ? '(wechat|alipay)' : k === 'cur' ? '([A-Z]{3})' : '(\\d{1,9})';
   }) + '$');
-  routes.push({ method, re, keys, handler, auth: opts.auth || 'none', raw: !!opts.raw });
+  routes.push({ method, re, keys, handler, auth: opts.auth || 'none', raw: !!opts.raw, open: !!opts.open });
 }
 
 // ---------- 登录 ----------
@@ -261,7 +261,7 @@ function assertOpen(trip) { if (trip.locked) throw new HttpError(423, '账单已
 
 async function tripPayload(trip, admin) {
   const [{ rows: members }, { rows: exps }, { rows: shares }, { rows: imgs }, { rows: pays }, { rows: codes }, { rows: rates }] = await Promise.all([
-    db.query(`SELECT m.id, m.person_id, p.name, m.weight::float AS weight FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 ORDER BY m.id`, [trip.id]),
+    db.query(`SELECT m.id, m.person_id, p.name, m.weight::float AS weight, m.pin_hash IS NOT NULL AS pin_hash FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 ORDER BY m.id`, [trip.id]),
     db.query(`SELECT id, payer_id, cents, currency, orig_cents, rate::float AS rate, cny_override, category, title, note, to_char(day,'YYYY-MM-DD') AS day, created_by, created_at, updated_at FROM expenses WHERE trip_id=$1 ORDER BY day DESC, id DESC`, [trip.id]),
     db.query(`SELECT s.expense_id, s.member_id, s.weight::float AS weight, s.fixed_cents, s.orig_cents, s.cents FROM expense_shares s JOIN expenses e ON e.id=s.expense_id WHERE e.trip_id=$1 ORDER BY s.member_id`, [trip.id]),
     db.query(`SELECT i.id, i.expense_id, i.note, i.created_by FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1 ORDER BY i.id`, [trip.id]),
@@ -285,7 +285,7 @@ async function tripPayload(trip, admin) {
   return {
     trip: { id: trip.id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at,
       base, toCny: toCnyFactor(base, rates, live) },
-    members: members.map((m) => ({ id: m.id, name: m.name, weight: m.weight, codes: codeMap[m.person_id] || {} })),
+    members: members.map((m) => ({ id: m.id, name: m.name, weight: m.weight, codes: codeMap[m.person_id] || {}, hasPin: !!m.pin_hash })),
     expenses, payments, balances, transfers,
     rates: Object.fromEntries(rates.map((r) => [r.currency, { rate: r.rate, updatedAt: r.updated_at }])),
     // 市场参考汇率（已换算成"1 单位 X = ? 结算币种"）
@@ -296,13 +296,35 @@ async function tripPayload(trip, admin) {
 }
 
 // 操作人：前端在请求头 X-Actor 里带上"我是谁"的成员 id
-async function actorName(q, trip, req, admin) {
+// 设了密码的成员还要在 X-Actor-Token 里带上输对密码时拿到的凭证。
+// 写操作在进入各接口之前由 identify() 统一核对，结果放在 req.actor = { id, name }。
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+async function identify(req, key) {
   const id = Number(req.headers['x-actor']);
-  if (id > 0 && id < 2147483647) {
-    const { rows: [m] } = await q.query(`SELECT p.name FROM members m JOIN people p ON p.id=m.person_id WHERE m.id=$1 AND m.trip_id=$2`, [id, trip.id]);
-    if (m) return m.name;
+  if (!(id > 0 && id < 2147483647)) return null;
+  const { rows: [m] } = await db.query(`SELECT m.id, p.name, m.pin_hash FROM members m JOIN people p ON p.id=m.person_id JOIN trips t ON t.id=m.trip_id
+    WHERE m.id=$1 AND t.key=$2 AND t.deleted_at IS NULL`, [id, key]);
+  if (!m) return null;
+  if (m.pin_hash) {
+    const tok = String(req.headers['x-actor-token'] || '');
+    const ok = tok && (await db.query(`SELECT 1 FROM member_tokens WHERE token_hash=$1 AND member_id=$2`, [sha256(tok), m.id])).rowCount;
+    if (!ok) return { id: m.id, name: m.name, needPin: true };
   }
-  return admin ? '管理员' : '未署名';
+  return { id: m.id, name: m.name };
+}
+async function actorName(q, trip, req, admin) {
+  return req.actor?.name || (admin ? '管理员' : '未署名');
+}
+// 只有记账人（创建人）和管理员能改 / 删
+function assertOwner(req, admin, owner, what) {
+  if (admin) return;
+  if (!owner || owner === '未署名' || owner === '管理员') throw new HttpError(403, `这${what}只有管理员能改`);
+  if (req.actor?.name !== owner) throw new HttpError(403, `这${what}是「${owner}」记的，只有 TA 和管理员能改`);
+}
+async function issueToken(q, memberId) {
+  const tok = crypto.randomBytes(24).toString('base64url');
+  await q.query(`INSERT INTO member_tokens(token_hash, member_id) VALUES($1,$2)`, [sha256(tok), memberId]);
+  return tok;
 }
 const log = (q, tripId, actor, action, detail) =>
   q.query(`INSERT INTO audit(trip_id,actor,action,detail) VALUES($1,$2,$3,$4)`, [tripId, actor, action, detail]);
@@ -351,6 +373,60 @@ route('POST', '/api/t/:key/members', async ({ params, body, req, admin }) => {
     await log(q, trip.id, await actorName(q, trip, req, admin), 'member.add', `添加了成员 ${name}${weight !== 1 ? `（${weight} 份）` : ''}`);
     return { id: m.id };
   });
+}, { open: true });   // 名单里没有自己的人要能先加入，所以不要求先选「我是谁」
+
+// ---------- 成员密码 ----------
+const PIN_MAX_FAILS = 5, PIN_LOCK_MIN = 15;
+const validPin = (p) => /^\d{4}$/.test(String(p ?? ''));
+// 选「我是谁」时输密码，输对了发一个凭证给这台手机
+route('POST', '/api/t/:key/members/:id/claim', async ({ params, body }) => {
+  const trip = await loadTrip(params.key);
+  // 输错次数要先存进去再报错，所以事务里只返回结果，出了事务再抛
+  const r = await tx(async (q) => {
+    const { rows: [m] } = await q.query(`SELECT m.id, m.pin_hash, m.pin_fails, m.pin_locked_until > now() AS locked,
+        ceil(extract(epoch FROM m.pin_locked_until - now()) / 60)::int AS mins FROM members m WHERE m.id=$1 AND m.trip_id=$2 FOR UPDATE`, [params.id, trip.id]);
+    if (!m) return { err: new HttpError(404, '成员不存在') };
+    if (!m.pin_hash) return { token: null };
+    if (m.locked) return { err: new HttpError(429, `密码输错太多次，${m.mins} 分钟后再试，或者找管理员重置`) };
+    if (!checkPassword(String(body.pin ?? ''), m.pin_hash)) {
+      const fails = m.pin_fails + 1;
+      if (fails >= PIN_MAX_FAILS) {
+        await q.query(`UPDATE members SET pin_fails=0, pin_locked_until=now() + make_interval(mins => $2) WHERE id=$1`, [m.id, PIN_LOCK_MIN]);
+        return { err: new HttpError(429, `密码输错 ${PIN_MAX_FAILS} 次，锁定 ${PIN_LOCK_MIN} 分钟`) };
+      }
+      await q.query(`UPDATE members SET pin_fails=$2 WHERE id=$1`, [m.id, fails]);
+      return { err: new HttpError(403, `密码不对，还能试 ${PIN_MAX_FAILS - fails} 次`, 'pin_wrong') };
+    }
+    await q.query(`UPDATE members SET pin_fails=0, pin_locked_until=NULL WHERE id=$1`, [m.id]);
+    return { token: await issueToken(q, m.id) };
+  });
+  if (r.err) throw r.err;
+  return r;
+}, { open: true });
+// 设置 / 修改自己的密码（必须已经是这个人）。其他手机上的凭证全部作废
+route('PUT', '/api/t/:key/members/:id/pin', async ({ params, body, req, admin }) => {
+  const trip = await loadTrip(params.key);
+  if (req.actor?.id !== params.id) throw new HttpError(403, '只能给自己设密码');
+  if (!validPin(body.pin)) throw bad('密码要 4 位数字');
+  return tripTx(trip, async (q) => {
+    await q.query(`UPDATE members SET pin_hash=$1, pin_fails=0, pin_locked_until=NULL WHERE id=$2`, [hashPassword(String(body.pin)), params.id]);
+    await q.query(`DELETE FROM member_tokens WHERE member_id=$1`, [params.id]);
+    await log(q, trip.id, req.actor.name, 'member.pin', `${req.actor.name} 设置了密码`);
+    return { token: await issueToken(q, params.id) };
+   }, { open: false });   // 账单锁定后也能改密码
+});
+// 取消密码：本人，或者管理员（忘了密码时重置）
+route('DELETE', '/api/t/:key/members/:id/pin', async ({ params, req, admin }) => {
+  const trip = await loadTrip(params.key);
+  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, '只有本人和管理员能取消密码');
+  await tripTx(trip, async (q) => {
+    const m = (await memberMap(q, trip.id)).get(params.id);
+    if (!m) throw new HttpError(404, '成员不存在');
+    await q.query(`UPDATE members SET pin_hash=NULL, pin_fails=0, pin_locked_until=NULL WHERE id=$1`, [m.id]);
+    await q.query(`DELETE FROM member_tokens WHERE member_id=$1`, [m.id]);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'member.pin', req.actor?.id === m.id ? `${m.name} 取消了密码` : `重置了 ${m.name} 的密码`);
+   }, { open: false });
+  return { ok: true };
 });
 route('PATCH', '/api/t/:key/members/:id', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
@@ -393,6 +469,7 @@ route('PUT', '/api/t/:key/paycode/:id/:kind', async ({ params, rawBody, req, adm
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
+  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员上传`);
   const img = saveImage(rawBody);
   const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`SELECT file FROM pay_codes WHERE person_id=$1 AND kind=$2`, [m.person_id, params.kind]);
@@ -408,6 +485,7 @@ route('DELETE', '/api/t/:key/paycode/:id/:kind', async ({ params, req, admin }) 
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
+  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员删除`);
   const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`DELETE FROM pay_codes WHERE person_id=$1 AND kind=$2 RETURNING file`, [m.person_id, params.kind]);
     if (o) await log(q, trip.id, await actorName(q, trip, req, admin), 'paycode.remove', `删除了 ${m.name} 的${KIND_CN[params.kind]}收款码`);
@@ -487,7 +565,7 @@ async function writeShares(q, expenseId, shares) {
   }
 }
 async function loadExpense(q, trip, id) {
-  const { rows: [e] } = await q.query(`SELECT id, payer_id AS "payerId", cents, currency, orig_cents AS "origCents", category, title, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1 AND trip_id=$2`, [id, trip.id]);
+  const { rows: [e] } = await q.query(`SELECT id, payer_id AS "payerId", cents, currency, orig_cents AS "origCents", category, title, created_by, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1 AND trip_id=$2`, [id, trip.id]);
   if (!e) throw new HttpError(404, '这笔账不存在（可能已被删除）');
   e.shares = (await q.query(`SELECT member_id FROM expense_shares WHERE expense_id=$1`, [id])).rows;
   return e;
@@ -538,6 +616,7 @@ route('PUT', '/api/t/:key/expenses/:id', async ({ params, body, req, admin }) =>
     const mm = await memberMap(q, trip.id);
     const actor = await actorName(q, trip, req, admin);
     const old = await loadExpense(q, trip, params.id);
+    assertOwner(req, admin, old.created_by, '笔账');
     const rate = await tripRate(q, trip, body.currency, body.rate, actor);
     const e = parseExpense(body, mm, todayStr(), rate, trip.base_currency);
     await q.query(`UPDATE expenses SET payer_id=$1,cents=$2,category=$3,title=$4,note=$5,day=$6,currency=$7,orig_cents=$8,rate=$9,cny_override=$10,updated_at=now() WHERE id=$11`,
@@ -670,6 +749,7 @@ route('DELETE', '/api/t/:key/expenses/:id', async ({ params, req, admin }) => {
   await tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
     const old = await loadExpense(q, trip, params.id);
+    assertOwner(req, admin, old.created_by, '笔账');
     const { rows: [row] } = await q.query(`SELECT *, to_char(day,'YYYY-MM-DD') AS day FROM expenses WHERE id=$1`, [old.id]);
     const { rows: shares } = await q.query(`SELECT * FROM expense_shares WHERE expense_id=$1`, [old.id]);
     const { rows: images } = await q.query(`SELECT * FROM images WHERE expense_id=$1 ORDER BY id`, [old.id]);
@@ -691,6 +771,7 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
   const img = saveImage(rawBody);
   return tripTx(trip, async (q) => {
     const e = await loadExpense(q, trip, params.id);
+    assertOwner(req, admin, e.created_by, '笔账');
     const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
     if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`每笔最多 ${MAX_IMAGES_PER_EXPENSE} 张图`);
     if (await tripImageBytes(q, trip.id) + img.bytes > TRIP_IMAGE_QUOTA)
@@ -712,7 +793,7 @@ route('PATCH', '/api/t/:key/images/:id', async ({ params, body, req, admin }) =>
     if (!i) throw new HttpError(404, '图片不存在');
     // 只有传图的人（旧图没记传图人，就按这笔账的记账人）和管理员能改备注
     const actor = await actorName(q, trip, req, admin), owner = i.created_by || i.exp_by;
-    if (!admin && (actor !== owner || actor === '未署名')) throw new HttpError(403, owner && !['未署名', '管理员'].includes(owner) ? `只有传这张图的「${owner}」和管理员能改备注` : '只有管理员能改这张图的备注');
+    assertOwner(req, admin, owner, '张图的备注');
     if (i.note === note) return { ok: true };
     await q.query(`UPDATE images SET note=$1 WHERE id=$2`, [note, i.id]);
     await log(q, trip.id, actor, 'image.note',
@@ -724,8 +805,10 @@ route('DELETE', '/api/t/:key/images/:id', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   await tripTx(trip, async (q) => {
-    const { rows: [i] } = await q.query(`SELECT i.*, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
+    const { rows: [i] } = await q.query(`SELECT i.*, e.title, e.category, e.cents, e.created_by AS exp_by FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
     if (!i) throw new HttpError(404, '图片不存在');
+    // 传图的人、这笔账的记账人、管理员都能删
+    if (!(req.actor && req.actor.name === i.created_by)) assertOwner(req, admin, i.exp_by, '笔账的图');
     const actor = await actorName(q, trip, req, admin);
     const label = `「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」的一张图`;
     await q.query(`INSERT INTO trash(trip_id,kind,label,data,files,deleted_by) VALUES($1,'image',$2,$3,$4,$5)`,
@@ -757,8 +840,9 @@ route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) =>
     const actor = await actorName(q, trip, req, admin);
     if (t.kind === 'image') {
       const i = t.data.image;
-      const { rows: [e] } = await q.query(`SELECT id FROM expenses WHERE id=$1 AND trip_id=$2`, [i.expense_id, trip.id]);
+      const { rows: [e] } = await q.query(`SELECT id, created_by FROM expenses WHERE id=$1 AND trip_id=$2`, [i.expense_id, trip.id]);
       if (!e) throw bad('这张图所属的账目已经删除了，先恢复那笔账');
+      if (!(req.actor && req.actor.name === i.created_by)) assertOwner(req, admin, e.created_by, '笔账的图');
       const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
       if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`这笔账已经有 ${MAX_IMAGES_PER_EXPENSE} 张图了`);
       await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [i.id, e.id, i.file, i.mime, i.bytes, i.note || '', i.created_by || '', i.created_at]);
@@ -806,8 +890,10 @@ route('DELETE', '/api/t/:key/payments/:id', async ({ params, req, admin }) => {
   assertOpen(trip);
   await tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
+    const { rows: [p0] } = await q.query(`SELECT created_by FROM payments WHERE id=$1 AND trip_id=$2`, [params.id, trip.id]);
+    if (!p0) throw new HttpError(404, '这条转账不存在');
+    assertOwner(req, admin, p0.created_by, '条转账记录');
     const { rows: [p] } = await q.query(`DELETE FROM payments WHERE id=$1 AND trip_id=$2 RETURNING *`, [params.id, trip.id]);
-    if (!p) throw new HttpError(404, '这条转账不存在');
     await log(q, trip.id, await actorName(q, trip, req, admin), 'payment.remove', `撤销了「${mm.get(p.from_id)?.name} 转给 ${mm.get(p.to_id)?.name} ${fmtMoney(trip.base_currency, p.cents)}」`);
   });
   return { ok: true };
@@ -1196,6 +1282,15 @@ const server = http.createServer(async (req, res) => {
     const admin = await currentAdmin(req);
     if (admin?.renewToken) res.setHeader('Set-Cookie', sessionCookie(admin.renewToken, SESSION_DAYS * 86400));
     if (r.auth === 'admin' && !admin) throw new HttpError(401, '请先登录');
+    // 游玩里的写操作：必须先选「我是谁」，设了密码的还要带上凭证（管理员除外）
+    if (params.key && req.method !== 'GET') {
+      req.actor = await identify(req, params.key);
+      if (req.actor?.needPin) {
+        if (!admin && !r.open) throw new HttpError(403, `「${req.actor.name}」设了密码，请重新选「我是谁」并输入密码`, 'pin_required');
+        req.actor = null;
+      }
+      if (!req.actor && !admin && !r.open) throw new HttpError(403, '先在右上角选「我是谁」再操作', 'who_required');
+    }
     const result = await r.handler({ req, res, admin, params, body, rawBody, query: url.searchParams });
     if (result && result.__file) {
       const f = result.__file;
@@ -1212,7 +1307,7 @@ const server = http.createServer(async (req, res) => {
     }
     send(200, result);
   } catch (e) {
-    if (e instanceof HttpError) return send(e.status, { error: e.message });
+    if (e instanceof HttpError) return send(e.status, e.code ? { error: e.message, code: e.code } : { error: e.message });
     console.error(e);
     // 数据库的金额校验触发器拦下了不平的账（说明代码有 bug），整笔已回滚，没有存进去
     if (/aa_invariant/.test(e.message)) return send(500, { error: '数据校验没通过，这次修改没有保存。请截图告诉管理员' });

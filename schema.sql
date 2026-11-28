@@ -214,3 +214,15 @@ CREATE CONSTRAINT TRIGGER aa_share_check AFTER INSERT OR UPDATE OR DELETE ON exp
 DROP TRIGGER IF EXISTS aa_payment_check ON payments;
 CREATE CONSTRAINT TRIGGER aa_payment_check AFTER INSERT OR UPDATE ON payments
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION aa_check_payment();
+
+-- 成员密码（4 位数字 PIN，可选）：设了以后，别的手机要以这个人的身份操作必须先输密码
+ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_hash text;                         -- scrypt$盐$哈希，NULL = 没设
+ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_fails int NOT NULL DEFAULT 0;      -- 连续输错次数
+ALTER TABLE members ADD COLUMN IF NOT EXISTS pin_locked_until timestamptz;          -- 输错太多，锁到这个时间
+-- 输对密码后发给这台手机的凭证（只存哈希）；改密码 / 取消密码 / 管理员重置时全部作废
+CREATE TABLE IF NOT EXISTS member_tokens (
+  token_hash text PRIMARY KEY,
+  member_id  int NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS member_tokens_member ON member_tokens(member_id);

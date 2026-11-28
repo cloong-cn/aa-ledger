@@ -3,10 +3,13 @@ const BASE = process.env.BASE || 'http://127.0.0.1:8792';
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => { cond ? pass++ : (fail++, console.log('✗', name, extra)); };
 let cookie = '';
-async function call(method, path, body, { actor, raw, type } = {}) {
+let defActor = null;   // 没指定 actor 时以谁的身份操作（写操作必须先选「我是谁」）；actor: 0 表示不带身份
+async function call(method, path, body, { actor, raw, type, token } = {}) {
   const headers = {};
   if (cookie) headers.Cookie = cookie;
+  actor = actor ?? defActor;
   if (actor) headers['X-Actor'] = String(actor);
+  if (token) headers['X-Actor-Token'] = token;
   let payload;
   if (raw) { payload = raw; headers['Content-Type'] = type || 'image/png'; }
   else if (body !== undefined) { payload = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
@@ -38,6 +41,10 @@ cookie = '';
 r = await call('GET', `/api/t/${key}`);
 ok('凭链接访问', r.status === 200 && r.data.members.length === 3 && !r.data.isAdmin);
 const [A, B, C] = r.data.members.map((m) => m.id);
+r = await call('POST', `/api/t/${key}/members`, { name: 'zz路人' }); ok('不选我是谁也能加入名单', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${r.data.id}`, { weight: '1' }); ok('不选我是谁不能改东西', r.status === 403 && r.data.code === 'who_required', JSON.stringify(r.data));
+r = await call('DELETE', `/api/t/${key}/members/${(await call('GET', `/api/t/${key}`)).data.members.find((m) => m.name === 'zz路人').id}`, undefined, { actor: A });
+defActor = A;
 r = await call('GET', '/api/t/AAAAAAAAAAAAAAAAAAAAAA'); ok('错误链接 404', r.status === 404);
 r = await call('GET', '/api/admin/trips'); ok('非管理员不能列游玩', r.status === 401);
 
@@ -79,7 +86,12 @@ ok('转账 3 笔都给 B', r.data.transfers.length === 3 && r.data.transfers.eve
 // 修改 & 不能移除有账的人
 r = await call('PUT', `/api/t/${key}/expenses/${E1}`, { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费',
   shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: B });
-ok('修改账目', r.status === 200);
+ok('别人不能改账', r.status === 403, JSON.stringify(r.data));
+r = await call('DELETE', `/api/t/${key}/expenses/${E1}`, undefined, { actor: B }); ok('别人不能删账', r.status === 403);
+r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, actor: B }); ok('别人不能给这笔加图', r.status === 403);
+r = await call('PUT', `/api/t/${key}/expenses/${E1}`, { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费',
+  shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: A });
+ok('记账人能改账', r.status === 200);
 r = await call('DELETE', `/api/t/${key}/members/${D}`); ok('有账的人不能移除', r.status === 400);
 r = await call('POST', `/api/t/${key}/members`, { name: 'zz戊' }); const Ex = r.data.id;
 r = await call('DELETE', `/api/t/${key}/members/${Ex}`); ok('无账的人能移除', r.status === 200);
@@ -98,14 +110,15 @@ r = await call('GET', `/api/t/${key}/images/${IMG}`);
 ok('读取图片', r.status === 200 && r.ct === 'image/png' && Buffer.compare(r.data, PNG) === 0);
 r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '  团购券截图 ' }, { actor: A }); ok('传图人能改备注', r.status === 200, r.status);
 r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '别人改的' }, { actor: B }); ok('别人不能改备注', r.status === 403, r.status);
-r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '别人改的' }); ok('未署名不能改备注', r.status === 403, r.status);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '别人改的' }, { actor: 0 }); ok('未署名不能改备注', r.status === 403, r.status);
 { const c = cookie; cookie = adminCookie;
   r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '团购券截图' }); ok('管理员能改备注', r.status === 200, r.status);
   cookie = c; }
 r = await call('GET', `/api/t/${key}`); ok('备注出现在账目里', r.data.expenses.find((e) => e.id === E1).imageNotes[IMG] === '团购券截图', JSON.stringify(r.data.expenses.find((e) => e.id === E1).imageNotes));
 r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '字'.repeat(201) }, { actor: A }); ok('备注超长被拒', r.status === 400);
 // 收款码
-r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png' }); ok('上传收款码', r.status === 200);
+r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png' }); ok('不能传别人的收款码', r.status === 403);
+r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png', actor: B }); ok('上传收款码', r.status === 200);
 r = await call('GET', `/api/t/${key}`); ok('收款码标记', !!r.data.members.find((m) => m.id === B).codes.wechat);
 r = await call('GET', `/api/t/${key}/paycode/${B}/wechat`); ok('读取收款码', r.status === 200 && r.ct === 'image/png');
 r = await call('GET', `/api/t/${key}/paycode/${A}/alipay`); ok('无收款码 404', r.status === 404);
@@ -115,7 +128,7 @@ cookie = adminCookie;
 r = await call('POST', '/api/admin/trips', { name: 'zz别的游玩', startDay: '2026-10-01', members: ['zz甲'] });
 const key2 = r.data.key; cookie = '';
 r = await call('GET', `/api/t/${key2}/images/${IMG}`); ok('跨游玩读图被拒', r.status === 404);
-r = await call('DELETE', `/api/t/${key2}/expenses/${E1}`); ok('跨游玩删账被拒', r.status === 404);
+r = await call('DELETE', `/api/t/${key2}/expenses/${E1}`); ok('跨游玩删账被拒', r.status === 404 || r.status === 403);
 
 // 转账
 r = await call('GET', `/api/t/${key}`);
@@ -123,10 +136,37 @@ const t0 = r.data.transfers[0];
 r = await call('POST', `/api/t/${key}/payments`, { fromId: t0.fromId, toId: t0.toId, amount: (t0.cents / 100).toFixed(2) }, { actor: t0.fromId });
 ok('标记已转', r.status === 200); const P1 = r.data.id;
 r = await call('GET', `/api/t/${key}`); ok('转账后剩 2 笔', r.data.transfers.length === 2);
-r = await call('DELETE', `/api/t/${key}/payments/${P1}`); ok('撤销转账', r.status === 200);
+r = await call('DELETE', `/api/t/${key}/payments/${P1}`, undefined, { actor: t0.fromId === A ? B : A }); ok('别人不能撤销转账', r.status === 403);
+r = await call('DELETE', `/api/t/${key}/payments/${P1}`, undefined, { actor: t0.fromId }); ok('撤销转账', r.status === 200);
 r = await call('GET', `/api/t/${key}`);
 for (const t of r.data.transfers) await call('POST', `/api/t/${key}/payments`, { fromId: t.fromId, toId: t.toId, amount: (t.cents / 100).toFixed(2) });
 r = await call('GET', `/api/t/${key}`); ok('全部结清', r.data.transfers.length === 0 && r.data.balances.every((b) => b.net === 0));
+
+// 成员密码
+r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '1234' }); ok('不能给别人设密码', r.status === 403);
+r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '12a4' }, { actor: B }); ok('密码要 4 位数字', r.status === 400);
+r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '2468' }, { actor: B }); ok('设密码', r.status === 200 && r.data.token);
+const TB = r.data.token;
+r = await call('GET', `/api/t/${key}`); ok('hasPin 标记', r.data.members.find((m) => m.id === B).hasPin && !r.data.members.find((m) => m.id === A).hasPin);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B }); ok('没凭证冒充有密码的人被拒', r.status === 403 && r.data.code === 'pin_required', JSON.stringify(r.data));
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: 'x'.repeat(32) }); ok('假凭证被拒', r.status === 403);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB }); ok('带凭证能操作', r.status === 200);
+r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '0000' }, { actor: 0 }); ok('输错密码', r.status === 403 && /还能试 4 次/.test(r.data.error), JSON.stringify(r.data));
+r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '2468' }, { actor: 0 }); ok('输对密码拿到凭证', r.status === 200 && r.data.token && r.data.token !== TB);
+const TB2 = r.data.token;
+r = await call('POST', `/api/t/${key}/members/${A}/claim`, { pin: '' }, { actor: 0 }); ok('没设密码的人直接通过', r.status === 200 && r.data.token === null);
+for (let i = 0; i < 5; i++) r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '1111' }, { actor: 0 });
+ok('输错 5 次锁定', r.status === 429, JSON.stringify(r.data));
+r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '2468' }, { actor: 0 }); ok('锁定期间输对也不行', r.status === 429);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB2 }); ok('已有凭证不受锁定影响', r.status === 200);
+r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '1357' }, { actor: B, token: TB2 }); ok('改密码', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB }); ok('改密码后旧凭证失效', r.status === 403);
+r = await call('DELETE', `/api/t/${key}/members/${B}/pin`); ok('别人不能取消密码', r.status === 403);
+{ const c = cookie; cookie = adminCookie;
+  r = await call('DELETE', `/api/t/${key}/members/${B}/pin`, undefined, { actor: 0 }); ok('管理员重置密码', r.status === 200);
+  cookie = c; }
+r = await call('GET', `/api/t/${key}`); ok('重置后没有密码', !r.data.members.find((m) => m.id === B).hasPin);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B }); ok('重置后不用凭证', r.status === 200);
 
 // 锁定
 r = await call('POST', `/api/t/${key}/lock`, {}); ok('锁定', r.status === 200);
@@ -189,7 +229,7 @@ cookie = adminCookie;
 r = await call('POST', '/api/admin/trips', { name: 'zz日本', startDay: '2026-12-01', baseCurrency: 'JPY', members: ['zz甲', 'zz乙'] });
 ok('建日元结算的游玩', r.status === 200); const jkey = r.data.key; const jid = r.data.id;
 cookie = '';
-r = await call('GET', `/api/t/${jkey}`); const [JA, JB] = r.data.members.map((m) => m.id);
+r = await call('GET', `/api/t/${jkey}`); const [JA, JB] = r.data.members.map((m) => m.id); defActor = JA;
 ok('结算币种 JPY', r.data.trip.base === 'JPY' && r.data.fx.rates.CNY > 1, JSON.stringify(r.data.fx));
 r = await call('POST', `/api/t/${jkey}/expenses`, { amount: '3000', payerId: JA, shares: [JA, JB].map((id) => ({ memberId: id })) });
 ok('默认币种=结算币种', r.status === 200);
@@ -242,7 +282,7 @@ for (const k of [jkey, ikey]) { const t = await call('GET', `/api/t/${k}`); awai
 
 // 操作记录
 r = await call('GET', `/api/t/${key}/log`);
-ok('操作记录', r.data.items.some((i) => i.actor === 'zz乙' && /修改了一笔/.test(i.detail)) && r.data.items.some((i) => /锁定/.test(i.detail)));
+ok('操作记录', r.data.items.some((i) => i.actor === 'zz甲' && /修改了一笔/.test(i.detail)) && r.data.items.some((i) => /锁定/.test(i.detail)));
 
 // 重置链接
 r = await call('POST', `/api/admin/trips/${tripId}/rekey`, {}); const newKey = r.data.key;
@@ -259,7 +299,7 @@ r = await fetch(BASE + `/api/t/${key}/lock`, { method: 'POST', headers: { 'Conte
   let t = await call('POST', '/api/admin/trips', { name: 'zz回收站', startDay: '2026-11-10', members: ['zz甲', 'zz乙', 'zz丙'] });
   const tk = t.data.key, tid = t.data.id;
   cookie = '';
-  let d = (await call('GET', `/api/t/${tk}`)).data; const [m1, m2, m3] = d.members.map((m) => m.id);
+  let d = (await call('GET', `/api/t/${tk}`)).data; const [m1, m2, m3] = d.members.map((m) => m.id); defActor = m1;
   // 并发：10 个人同时第一次用日元记账、各自带不同汇率 → 只能有一个汇率生效，所有账都按它算
   const rs = await Promise.all(Array.from({ length: 10 }, (_, i) => call('POST', `/api/t/${tk}/expenses`, { amount: String(1000 + i * 7), currency: 'JPY', rate: (0.046 + i / 10000).toFixed(4), payerId: [m1, m2, m3][i % 3],
     shares: [m3, m1, m2].map((id) => ({ memberId: id, weight: 1 })) })));
@@ -275,12 +315,14 @@ r = await fetch(BASE + `/api/t/${key}/lock`, { method: 'POST', headers: { 'Conte
   const ex = d.expenses.find((e) => e.origCents === 300000);
   await call('POST', `/api/t/${tk}/expenses/${ex.id}/images`, null, { raw: PNG });
   let r2 = await call('DELETE', `/api/t/${tk}/expenses/${ex.id}`, undefined, { actor: m2 });
+  ok('不是记账人不能删', r2.status === 403);
+  r2 = await call('DELETE', `/api/t/${tk}/expenses/${ex.id}`, undefined, { actor: m1 });
   ok('删账', r2.status === 200);
   r2 = await call('GET', `/api/t/${tk}/trash`);
   const tr = r2.data.items[0];
-  ok('回收站里有这笔', r2.data.items.length === 1 && tr.kind === 'expense' && tr.deletedBy === 'zz乙', JSON.stringify(r2.data));
+  ok('回收站里有这笔', r2.data.items.length === 1 && tr.kind === 'expense' && tr.deletedBy === 'zz甲', JSON.stringify(r2.data));
   r2 = await call('GET', `/api/t/${key}/trash`); ok('别的游玩看不到', !r2.data.items?.some((i) => i.id === tr.id));
-  r2 = await call('POST', `/api/t/${key}/trash/${tr.id}/restore`, {}); ok('不能从别的游玩恢复', r2.status === 404);
+  r2 = await call('POST', `/api/t/${key}/trash/${tr.id}/restore`, {}); ok('不能从别的游玩恢复', r2.status === 404 || r2.status === 403);
   // 删除期间改了汇率，恢复时按现在的汇率重算
   await call('PUT', `/api/t/${tk}/rates/JPY`, { rate: '0.048' });
   r2 = await call('POST', `/api/t/${tk}/trash/${tr.id}/restore`, {}, { actor: m1 });
@@ -348,7 +390,7 @@ cookie = '';
   cookie = adminCookie;
   let x = await call('POST', '/api/admin/trips', { name: 'zz四舍五入', startDay: '2026-11-20', members: ['zz甲', 'zz乙'] });
   const k = x.data.key; cookie = '';
-  const t0 = (await call('GET', `/api/t/${k}`)).data; const [P, Q] = t0.members.map((m) => m.id);
+  const t0 = (await call('GET', `/api/t/${k}`)).data; const [P, Q] = t0.members.map((m) => m.id); defActor = P;
   await call('POST', `/api/t/${k}/expenses`, { amount: '31.95', payerId: P, day: '2026-11-20', shares: [{ memberId: P, weight: 1 }, { memberId: Q, weight: 1 }] });
   const t1 = (await call('GET', `/api/t/${k}`)).data;
   ok('31.95 两人分：乙应付 15.98（精确 15.975 四舍五入）', JSON.stringify(t1.transfers.map((y) => y.cents)) === '[1598]', JSON.stringify(t1.transfers));
