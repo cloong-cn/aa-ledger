@@ -155,6 +155,27 @@ function openSheet(html, onMount) {
   $sheet.scrollTop = 0;
   onMount && onMount($sheet);
 }
+// 弹窗在最顶上时，手指往下拖超过 90px 就关掉（跟系统弹窗一样）
+(() => {
+  let y0 = null, dy = 0;
+  $sheet.addEventListener('touchstart', (e) => {
+    y0 = $sheet.scrollTop <= 0 && e.touches.length === 1 && !e.target.closest('input,textarea,select,.filter-row,.chips') ? e.touches[0].clientY : null; dy = 0;
+  }, { passive: true });
+  $sheet.addEventListener('touchmove', (e) => {
+    if (y0 == null) return;
+    dy = e.touches[0].clientY - y0;
+    if (dy <= 0 || $sheet.scrollTop > 0) { $sheet.style.transform = ''; return; }
+    e.preventDefault();
+    $sheet.style.transition = 'none'; $sheet.style.transform = `translateY(${dy}px)`;
+  }, { passive: false });
+  $sheet.addEventListener('touchend', () => {
+    if (y0 == null) return;
+    $sheet.style.transition = 'transform .18s ease-out';
+    if (dy > 90) { $sheet.style.transform = 'translateY(100%)'; setTimeout(() => { closeSheet(); $sheet.style.transform = ''; $sheet.style.transition = ''; }, 170); }
+    else { $sheet.style.transform = ''; setTimeout(() => { $sheet.style.transition = ''; }, 200); }
+    y0 = null;
+  });
+})();
 function closeSheet(fromPop = false) {
   if (!fromPop && !$sheet.hidden) popOverlay('sheet');
   const cb = $sheet._onClose; $sheet._onClose = null; if (cb) cb();
@@ -717,7 +738,13 @@ async function newTripSheet(viaInvite) {
 // ======================================================================
 // 游玩页
 // ======================================================================
+// 从别的 App 切回来（超过 20 秒）且没有打开弹窗：自动刷新一下，看到朋友刚记的账
+let lastLoad = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.trip && $sheet.hidden && $viewer.hidden && Date.now() - lastLoad > 20000) refresh().catch(() => {});
+});
 async function loadTrip(first = false) {
+  lastLoad = Date.now();
   try {
     S.trip = await api('GET', `/api/t/${S.key}`);
     BASE = S.trip.trip.base;
@@ -1027,7 +1054,7 @@ function expenseDetail(id) {
       <div class="kv"><span>怎么分</span><span>${e.shares.length} 人 · ${mode}</span></div>
     </div>
     <div class="card"><h2>每人分摊</h2>
-      ${e.shares.map((s) => `<div class="kv"><span>${esc(nameOf(s.memberId))}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== BASE ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
+      ${e.shares.map((s) => `<div class="kv${s.memberId === S.me ? ' me-row' : ''}"><span>${esc(nameOf(s.memberId))}${s.memberId === S.me ? ' <span class="tag ink">我</span>' : ''}${s.fixed != null ? ' <span class="tag">指定</span>' : s.weight !== 1 ? ` <span class="tag">${s.weight} 份</span>` : ''}</span><span class="num">${e.currency !== BASE ? `${curMoney(e.currency, s.origCents)} <span class="faint">≈${money(s.cents)}</span>` : money(s.cents)}</span></div>`).join('')}
       ${exactNote(e)}
     </div>
     ${e.note ? `<div class="section-title"><span>备注</span></div><div class="note-box">${esc(e.note)}</div>` : ''}
@@ -1059,7 +1086,7 @@ function expenseForm(exp) {
     title: exp?.title || '', note: exp?.note || '',
     category: exp?.category || 'food',
     payerId: exp?.payerId ?? S.me ?? d.members[0].id,
-    day: exp?.day || (d.trip.endDay && S.today > d.trip.endDay ? d.trip.startDay : S.today < d.trip.startDay ? d.trip.startDay : S.today),
+    day: exp?.day || (S.lastDay?.key === S.key && S.lastDay.day) || (d.trip.endDay && S.today > d.trip.endDay ? d.trip.startDay : S.today < d.trip.startDay ? d.trip.startDay : S.today),
     parts: new Map(), // memberId -> {weight, fixed(string|'')}
     detail: false,
   };
@@ -1273,6 +1300,7 @@ function expenseForm(exp) {
       };
       try {
         store.set('aa:cur:' + S.key, f.currency);
+        S.lastDay = { key: S.key, day: payload.day };   // 下一笔默认用同一天
         const res = exp ? await api('PUT', `/api/t/${S.key}/expenses/${exp.id}`, payload) : await api('POST', `/api/t/${S.key}/expenses`, payload);
         let failed = 0;
         for (let i = 0; i < newFiles.length; i++) {
@@ -1530,9 +1558,12 @@ function drawPoster() {
 }
 
 // ---------- 统计 ----------
+// 柱子上的短金额：¥2760、1.2万
+const shortMoney = (c) => { const y = c / 100; return y >= 10000 ? `${(y / 10000).toFixed(y >= 100000 ? 0 : 1)}万` : `${BASE === 'CNY' ? '¥' : ''}${Math.round(y)}`; };
 function vbars(items) {
   const max = Math.max(1, ...items.map((i) => i.v));
-  return `<div class="vbars">${items.map((i) => `<div class="col" title="${esc(i.tip)}" tabindex="0"><span class="tip num">${money(i.v)}</span><div class="b" style="height:${i.v ? Math.max(2, (i.v / max) * 100) : 0}%"></div></div>`).join('')}</div>
+  const show = items.length <= 10;   // 柱子不多时直接标金额，多了点一下再看
+  return `<div class="vbars${show ? ' vals' : ''}">${items.map((i) => `<div class="col" title="${esc(i.tip)}" tabindex="0">${show && i.v ? `<span class="val num">${shortMoney(i.v)}</span>` : `<span class="tip num">${money(i.v)}</span>`}<div class="b" style="height:${i.v ? Math.max(2, (i.v / max) * 100) : 0}%"></div></div>`).join('')}</div>
     <div class="vlabels">${items.map((i) => `<span>${esc(i.short ?? i.label)}</span>`).join('')}</div>`;
 }
 function catBars(list, total) {

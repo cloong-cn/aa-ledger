@@ -464,3 +464,9 @@ details[open] > summary::before { content: "▾ "; }
 .lg-item .sk.lg-ic { border-radius: 50%; }
 .lg-more .lg-item::before { display: none; }
 @media (prefers-reduced-motion: reduce) { .sk, #loadbar::before { animation: none; } }
+
+/* 柱子上直接标金额 */
+.vbars.vals { padding-top: 22px; }
+.vbars .col .val { font-size: 10.5px; color: var(--muted); white-space: nowrap; margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+/* 详情里「我」那一行 */
+.kv.me-row { background: var(--accent-soft); margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 10px; }
