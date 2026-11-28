@@ -470,3 +470,19 @@ details[open] > summary::before { content: "▾ "; }
 .vbars .col .val { font-size: 10.5px; color: var(--muted); white-space: nowrap; margin-bottom: 3px; font-variant-numeric: tabular-nums; }
 /* 详情里「我」那一行 */
 .kv.me-row { background: var(--accent-soft); margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 10px; }
+
+/* 结算页底部：展开统计 */
+.stats-toggle { display: flex; align-items: center; gap: 10px; width: 100%; margin: 18px 0 10px; padding: 14px 16px; border: 0; border-radius: var(--r-lg); background: var(--card); box-shadow: var(--shadow); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.stats-toggle .m { flex: 1; min-width: 0; }
+.stats-toggle .m b, .stats-toggle .sub { display: block; }
+.stats-toggle .m b { font-weight: 600; }
+.stats-toggle .sub { font-size: 12.5px; color: var(--muted); }
+.stats-toggle .chev { color: var(--faint); font-size: 20px; transition: transform .2s; }
+.stats-toggle.on .chev { transform: rotate(90deg); }
+/* 成员页：更多设置（折叠） */
+.more-set { margin-top: 12px; }
+.more-set summary { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 4px; cursor: pointer; list-style: none; color: var(--muted); font-size: 14px; }
+.more-set summary::-webkit-details-marker, .more-set summary::marker { display: none; content: ''; }
+.more-set > summary::before, .more-set[open] > summary::before { content: none; display: none; }
+.more-set summary > span:first-child::after { content: ' ›'; display: inline-block; transition: transform .2s; }
+.more-set[open] summary > span:first-child::after { transform: rotate(90deg); }

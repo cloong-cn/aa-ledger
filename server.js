@@ -53,8 +53,9 @@ function cleanText(v, max) {
   return String(v ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim().slice(0, max);
 }
 // 类别（跟 public/app.js 的 CATS 保持一致；大类分组只在前端用）
-const CATEGORIES = { food: '餐饮', snack: '饮品零食', grocery: '超市', lodging: '住宿', transport: '交通', taxi: '打车', flight: '机票火车', rental: '租车',
-  fuel: '油费充电', parking: '停车过路', ticket: '门票', fun: '娱乐', shopping: '购物', gift: '伴手礼', other: '其他' };
+// 类别 key（数据库里存的）→ 显示名。界面只用 6 个大类，所以小类都显示成所属大类的名字（跟 public/app.js 的 GROUPS 一致）
+const CATEGORIES = { food: '吃喝', snack: '吃喝', grocery: '吃喝', lodging: '住宿', transport: '交通', taxi: '交通', flight: '交通', rental: '交通',
+  fuel: '交通', parking: '交通', ticket: '玩乐', fun: '玩乐', shopping: '购物', gift: '购物', other: '其他' };
 // 支持的币种。每次游玩选一个结算币种（默认人民币），其他币种按汇率折算成它
 const CURRENCIES = {
   CNY: { name: '人民币', sym: '¥' }, HKD: { name: '港币', sym: 'HK$' }, TWD: { name: '新台币', sym: 'NT$' },
@@ -670,6 +671,7 @@ route('GET', '/api/fx', async () => liveRates());
 route('PUT', '/api/t/:key/base', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
   assertOpen(trip);
+  if (!canManage(req, admin, trip)) throw new HttpError(403, '只有管理员能更换结算币种');
   const from = trip.base_currency, to = body.currency;
   if (!CURRENCIES[to]) throw bad('币种不对');
   if (to === from) return { ok: true, recomputed: 0 };

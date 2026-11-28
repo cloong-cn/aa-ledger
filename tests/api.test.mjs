@@ -276,14 +276,17 @@ ok('日元结算净额都是整円', r.data.balances.every((b) => b.net % 100 ==
 r = await call('POST', `/api/t/${jkey}/payments`, { fromId: JA, toId: JB, amount: '1.5' }); ok('日元转账不能有小数', r.status === 400);
 for (const id of [J3, J4]) await call('DELETE', `/api/t/${jkey}/expenses/${id}`);
 // 换结算币种 JPY → CNY（1 日元 = 0.05 人民币）
+r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'CNY', rate: '0.05' }); ok('普通成员不能换结算币种', r.status === 403);
+cookie = adminCookie;
 r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'CNY', rate: '0.05' });
 ok('换结算币种', r.status === 200 && r.data.recomputed === 2, JSON.stringify(r.data));
+cookie = '';
 r = await call('GET', `/api/t/${jkey}`);
 const jy = r.data.expenses.find((e) => e.currency === 'JPY'), cn = r.data.expenses.find((e) => e.currency === 'CNY');
 ok('换后：日元账 3000×0.05=150，人民币账=100', r.data.trip.base === 'CNY' && jy.cents === 15000 && jy.rate === 0.05 && cn.cents === 10000 && cn.rate === 1, JSON.stringify([jy, cn]));
 ok('换后汇率表只剩 JPY', JSON.stringify(Object.keys(r.data.rates)) === '["JPY"]' && r.data.rates.JPY.rate === 0.05);
 r = await call('POST', `/api/t/${jkey}/payments`, { fromId: JA, toId: JB, amount: '1' });
-r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'USD' }); ok('有转账后不能换', r.status === 400);
+cookie = adminCookie; r = await call('PUT', `/api/t/${jkey}/base`, { currency: 'USD' }); ok('有转账后不能换', r.status === 400); cookie = '';
 cookie = adminCookie;
 r = await call('GET', '/api/admin/stats?year=2026'); const jt = r.data.trips.find((t) => t.id === jid);
 ok('年度统计折算人民币', jt && jt.total === 25000, JSON.stringify(jt));
@@ -372,7 +375,7 @@ r = await fetch(BASE + `/api/t/${key}/lock`, { method: 'POST', headers: { 'Conte
   // 换结算币种后再恢复：按新币种重算
   const ex2 = d.expenses.find((e) => e.origCents === 100000);
   await call('DELETE', `/api/t/${tk}/expenses/${ex2.id}`);
-  r2 = await call('PUT', `/api/t/${tk}/base`, { currency: 'JPY', rate: '21' }); ok('换结算币种', r2.status === 200, JSON.stringify(r2.data));
+  cookie = adminCookie; r2 = await call('PUT', `/api/t/${tk}/base`, { currency: 'JPY', rate: '21' }); cookie = ''; ok('换结算币种', r2.status === 200, JSON.stringify(r2.data));
   const tr2 = (await call('GET', `/api/t/${tk}/trash`)).data.items.find((i) => i.kind === 'expense');
   r2 = await call('POST', `/api/t/${tk}/trash/${tr2.id}/restore`, {}); ok('换币种后恢复', r2.status === 200, JSON.stringify(r2.data));
   d = (await call('GET', `/api/t/${tk}`)).data;

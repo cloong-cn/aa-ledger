@@ -3,8 +3,9 @@
 const $app = document.getElementById('app');
 const { computeShares, splitExpense, exactShares, unitOf, roundTo } = window.AASettle;
 
-// 类别分两级：6 个大类（记账时一排选完）+ 小类（选了大类才出现）。统计按大类汇总，不会因为类别多而变乱。
-// 每个大类的第一个小类是默认值。新增类别时同时改 server.js 的 CATEGORIES
+// 类别：界面上只用 6 个大类（记账时一排选完，统计也按大类）。
+// 数据库里还是存原来的小类 key（旧账不动），显示时一律显示成所属大类。选大类时存这个大类的第一个小类。
+// 新增类别时同时改 server.js 的 CATEGORIES
 const GROUPS = [
   { key: 'eat', name: '吃喝', icon: '🍜' },
   { key: 'stay', name: '住宿', icon: '🏨' },
@@ -30,8 +31,9 @@ const CATS = [
   { key: 'gift', name: '伴手礼', icon: '🎁', g: 'buy' },
   { key: 'other', name: '其他', icon: '📦', g: 'misc' },
 ];
-const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
 const GROUP = Object.fromEntries(GROUPS.map((g) => [g.key, g]));
+for (const c of CATS) Object.assign(c, { sub: c.name, name: GROUP[c.g].name, icon: GROUP[c.g].icon });   // 小类显示成大类
+const CAT = Object.fromEntries(CATS.map((c) => [c.key, c]));
 const groupOf = (key) => (CAT[key] || CAT.other).g;
 // [{key, cents}] → 按大类汇总：[{g, cents, subs:[{key, cents}]}]，金额从大到小
 function groupCats(list) {
@@ -47,7 +49,7 @@ function groupCats(list) {
   return [...m.values()].map((x) => ({ ...x, subs: [...x.subs].map(([key, cents]) => ({ key, cents })).sort((a, b) => b.cents - a.cents) })).sort((a, b) => b.cents - a.cents);
 }
 // 某大类下只有一个小类且名字跟大类一样时，不用再列小类
-const showSubs = (x) => x.subs.length > 1 || CAT[x.subs[0].key].name !== x.g.name;
+const showSubs = () => false;   // 只按大类显示
 // 币种（顺序即选择顺序）。每次游玩有一个结算币种（默认人民币），其他币种折算成它
 const CURS = [
   { key: 'CNY', name: '人民币', short: '人民币', sym: '¥' },
@@ -793,7 +795,8 @@ function renderTrip() {
   } else {
     mine = `<div><span class="label">笔数</span><b class="num">${d.expenses.length}</b></div><div><span class="label">待转账</span><b class="num">${d.transfers.length} 笔</b></div>`;
   }
-  const tabs = [['bills', '🧾', '账单'], ['settle', '💸', '结算'], ['stats', '📊', '统计'], ['people', '👥', '成员']];
+  if (S.tab === 'stats') S.tab = 'settle';   // 统计已经并进结算页
+  const tabs = [['bills', '🧾', '账单'], ['settle', '💸', '结算'], ['people', '👥', '成员']];
   $app.innerHTML = `<div class="wrap">
     <div class="top">
       <a class="icon-btn" href="/" data-link aria-label="返回首页">‹</a>
@@ -1143,9 +1146,8 @@ function expenseForm(exp) {
       preview();
     };
     const drawCats = () => {
-      const g = groupOf(f.category), subs = CATS.filter((c) => c.g === g);
-      $('#f-cat').innerHTML = `<div class="cat-groups">${GROUPS.map((G) => `<button type="button" class="${G.key === g ? 'on' : ''}" data-g="${G.key}"><span class="i">${G.icon}</span>${G.name}</button>`).join('')}</div>`
-        + (subs.length > 1 ? `<div class="chips cat-subs">${subs.map((c) => `<button type="button" class="chip small-chip ${f.category === c.key ? 'on' : ''}" data-c="${c.key}">${c.icon} ${c.name}</button>`).join('')}</div>` : '');
+      const g = groupOf(f.category);
+      $('#f-cat').innerHTML = `<div class="cat-groups">${GROUPS.map((G) => `<button type="button" class="${G.key === g ? 'on' : ''}" data-g="${G.key}"><span class="i">${G.icon}</span>${G.name}</button>`).join('')}</div>`;
     };
     const drawPayer = () => { $('#f-payer').innerHTML = d.members.map((m) => `<button type="button" class="chip ${f.payerId === m.id ? 'on' : ''}" data-p="${m.id}">${esc(m.name)}</button>`).join(''); };
     const drawWho = () => {
@@ -1363,7 +1365,16 @@ function renderSettle(body) {
       <span class="num">${money(p.cents)}${editable() && canOwn(p.createdBy) ? ` <button class="btn ghost small" data-undo="${p.id}">撤销</button>` : ''}</span></div>`).join('')}</div>`;
   }
   html += `<div class="btns" style="margin-top:4px"><button class="btn" id="poster">🖼️ 生成结算长图</button>${editable() && d.transfers.length ? '<button class="btn" id="lock">🔒 锁定账单</button>' : ''}</div>`;
+  // 统计（原来的「统计」标签）：折叠在结算页最下面，想看再展开
+  html += `<button class="stats-toggle ${S.statsOpen ? 'on' : ''}" id="st-toggle" aria-expanded="${!!S.statsOpen}"><span class="m"><b>📊 看看钱花在哪了</b><span class="sub">分类、每天花费、最大几笔</span></span><span class="chev">›</span></button><div id="st-body"></div>`;
   body.innerHTML = html;
+  const stb = body.querySelector('#st-body');
+  if (S.statsOpen) renderStats(stb, true);
+  body.querySelector('#st-toggle').onclick = () => {
+    S.statsOpen = !S.statsOpen;
+    const t = body.querySelector('#st-toggle'); t.classList.toggle('on', S.statsOpen); t.setAttribute('aria-expanded', S.statsOpen);
+    if (S.statsOpen) { renderStats(stb, true); requestAnimationFrame(() => t.scrollIntoView({ block: 'start', behavior: reduceMotion() ? 'auto' : 'smooth' })); } else stb.innerHTML = '';
+  };
   body.querySelectorAll('[data-code]').forEach((b) => b.onclick = () => showCodes(Number(b.dataset.code)));
   body.querySelectorAll('[data-paid]').forEach((b) => b.onclick = () => paidSheet(d.transfers[Number(b.dataset.paid)]));
   body.querySelectorAll('[data-undo]').forEach((b) => b.onclick = async () => {
@@ -1585,7 +1596,8 @@ function bindBars(root) {
   });
 }
 
-function renderStats(body) {
+// embedded：放在结算页里时，不再重复「每个人」（结算页已经有每人明细）
+function renderStats(body, embedded = false) {
   const d = T();
   if (!d.expenses.length) { body.innerHTML = `<div class="empty"><div class="e">📊</div>记了账之后这里会有统计</div>`; return; }
   const total = d.expenses.reduce((a, e) => a + e.cents, 0);
@@ -1601,7 +1613,7 @@ function renderStats(body) {
   // 每人：垫付 vs 应摊
   const rows = d.balances.filter((b) => member(b.memberId)).sort((a, b) => b.share - a.share);
   const maxP = Math.max(1, ...rows.map((b) => Math.max(b.paid, b.share)));
-  html += `<div class="card"><h2>每个人</h2><div class="legend"><span><i></i>垫付</span><span><i class="b2"></i>应摊（自己花的）</span></div>
+  if (!embedded) html += `<div class="card"><h2>每个人</h2><div class="legend"><span><i></i>垫付</span><span><i class="b2"></i>应摊（自己花的）</span></div>
     ${rows.map((b) => `<div class="hbar" title="${esc(nameOf(b.memberId))}：垫付 ${money(b.paid)}，应摊 ${money(b.share)}，占总花费 ${Math.round((b.share / total) * 100)}%">
       <div class="lab"><span>${esc(nameOf(b.memberId))}${b.memberId === S.me ? ' <span class="tag ink">我</span>' : ''}</span><span class="num">垫付 ${money(b.paid)} · 应摊 ${money(b.share)}</span></div>
       <div class="track"><div class="fill" style="width:${(b.paid / maxP) * 100}%"></div></div>
@@ -1661,14 +1673,17 @@ function renderPeople(body) {
   html += `<div class="section-title"><span>这次游玩</span></div>
     <div class="list">
       <button class="item" id="pm-share"><span class="cat">🔗</span><span class="main"><span class="t">分享链接</span><span class="s">发到群里，大家打开就能记账</span></span></button>
-      <button class="item" id="pm-base"><span class="cat">🪙</span><span class="main"><span class="t">结算币种：${BN()}</span><span class="s">${ed ? (d.payments.length ? '已有转账记录，不能再换' : '分摊和转账都按它算，点击更换') : '分摊和转账都按它算'}</span></span></button>
-      ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
-      ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} ${BN()}</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
       <a class="item" id="pm-export" href="/api/t/${esc(S.key)}/export" download><span class="cat">📑</span><span class="main"><span class="t">导出 Excel</span><span class="s">账目明细、每人汇总、转账记录</span></span></a>
       <button class="item" id="pm-trash"><span class="cat">🗑️</span><span class="main"><span class="t">最近删除</span><span class="s">误删的账目和截图 30 天内可以恢复</span></span></button>
       <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔，所有人都能看</span></span></button>
       ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
     </div>
+    <details class="more-set"${S.moreOpen ? ' open' : ''}><summary><span>⚙️ 更多设置</span><span class="faint small">${ed ? '名称日期、' : ''}结算币种${Object.keys(d.rates).length ? '、汇率' : ''}</span></summary>
+      <div class="list">
+      <button class="item" id="pm-base"><span class="cat">🪙</span><span class="main"><span class="t">结算币种：${BN()}</span><span class="s">${ed && canManage() ? (d.payments.length ? '已有转账记录，不能再换' : '分摊和转账都按它算，点击更换') : '分摊和转账都按它算' + (ed ? '（管理员可以更换）' : '')}</span></span></button>
+      ${ed ? `<button class="item" id="pm-edit"><span class="cat">✏️</span><span class="main"><span class="t">修改名称和日期</span><span class="s">${esc(t.name)} · ${range(t)}</span></span></button>` : ''}
+      ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} ${BN()}</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
+      </div></details>
     ${t.note ? `<div class="section-title"><span>说明</span></div><div class="note-box">${esc(t.note)}</div>` : ''}`;
   if (!d.isAdmin && isTripAdminMe() && t.locked) {
     html += `<div class="section-title"><span>管理员</span></div><div class="list">
@@ -1696,7 +1711,8 @@ function renderPeople(body) {
   body.querySelector('#pm-log').onclick = logSheet;
   const sp = body.querySelector('#pm-setpin'); if (sp) sp.onclick = setPin;
   body.querySelector('#pm-trash').onclick = trashSheet;
-  if (ed && !d.payments.length) body.querySelector('#pm-base').onclick = baseSheet;
+  if (ed && canManage() && !d.payments.length) body.querySelector('#pm-base').onclick = baseSheet;
+  body.querySelector('.more-set').ontoggle = (e) => { S.moreOpen = e.target.open; };
   if (ed) body.querySelectorAll('[data-rate]').forEach((b) => b.onclick = () => rateSheet(b.dataset.rate));
   const pe = body.querySelector('#pm-edit'); if (pe) pe.onclick = tripEditSheet;
   const pl = body.querySelector('#pm-lock'); if (pl) pl.onclick = lockTrip;
