@@ -313,23 +313,49 @@ textarea.input { resize: vertical; min-height: 64px; }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.ink { background: var(--ink); color: var(--on-ink); }
 
-/* 操作记录 */
-.lg-day { font-size: 13px; font-weight: 600; color: var(--muted); margin: 14px 4px 6px; }
-.lg-card { padding: 4px 14px; }
-.lg-item { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; }
-.lg-item + .lg-item { border-top: 1px solid var(--line); }
-.lg-ic { flex: none; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-size: 15px; background: var(--soft); }
+/* 操作记录：按天的时间线 */
+.lg-day { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; color: var(--muted); margin: 16px 6px 8px; }
+.lg-day span + span { font-weight: 400; color: var(--faint); }
+.lg-card { padding: 6px 14px; }
+.lg-item { position: relative; display: flex; gap: 12px; align-items: flex-start; padding: 12px 0; }
+/* 图标之间的竖线，串成时间线 */
+.lg-item:not(:last-child)::before { content: ''; position: absolute; left: 16px; top: 46px; bottom: -10px; width: 2px; background: var(--line); border-radius: 1px; }
+.lg-ic { position: relative; flex: none; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-size: 15px; background: var(--soft); }
 .lg-ic.good { background: var(--good-soft); } .lg-ic.danger { background: var(--danger-soft); } .lg-ic.warn { background: var(--warn-soft); } .lg-ic.accent { background: var(--accent-soft); }
-.lg-main { flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; }
+.lg-item[data-adm] .lg-ic { box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--warn); }
+.lg-main { position: relative; flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; padding-top: 6px; }
+.lg-t { padding-right: 58px; }  /* 右上角留给时间 */
+.lg-t > * { margin-right: 6px; }
 .lg-t b { font-weight: 600; }
+.lg-t .tag { margin-left: 0; vertical-align: 1px; }
 .lg-v { color: var(--muted); }
-.lg-d { color: var(--text); font-size: 13.5px; margin-top: 2px; word-break: break-word; }
-.lg-same { color: var(--faint); font-size: 12px; margin-top: 2px; }
-.lg-diff { margin-top: 3px; font-size: 13.5px; border-left: 2px solid var(--line); padding-left: 8px; }
-.lg-old { color: var(--faint); text-decoration: line-through; }
-.lg-new mark { background: var(--warn-soft); color: var(--warn); border-radius: 3px; padding: 0 2px; }
-.lg-item[data-adm] .lg-ic { box-shadow: 0 0 0 2px var(--warn); }
-.lg-time { flex: none; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; padding-top: 2px; }
+.lg-time { position: absolute; top: 7px; right: 0; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.lg-d { color: var(--text); font-size: 13.5px; margin-top: 4px; word-break: break-word; }
+/* 账目小卡片 */
+.lg-exp { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding: 9px 12px; border-radius: 12px; background: var(--soft); }
+.lg-exp-m { flex: 1; min-width: 0; }
+.lg-exp-m b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lg-exp-m span { display: block; font-size: 12px; color: var(--muted); }
+.lg-amt { flex: none; font-weight: 700; font-size: 15px; }
+.lg-exp.gone, .lg-pay.gone { opacity: .6; }
+.lg-exp.gone .lg-amt, .lg-exp.gone b, .lg-pay.gone .lg-amt { text-decoration: line-through; }
+/* 修改了哪些字段 */
+.lg-chs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.lg-ch { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; padding: 3px 9px; border-radius: 999px; background: var(--warn-soft); color: var(--text); }
+.lg-ch i { font-style: normal; color: var(--muted); }
+.lg-ch s { color: var(--faint); }
+.lg-ch b { color: var(--warn); font-weight: 600; }
+.lg-ch .arr { color: var(--faint); }
+.lg-ch.none { background: var(--soft); color: var(--muted); }
+/* 转账 */
+.lg-pay { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 8px 12px; border-radius: 12px; background: var(--good-soft); font-size: 13.5px; }
+.lg-pay .arr { color: var(--muted); margin: 0 2px; }
+.lg-pay .lg-amt { margin-left: auto; color: var(--good); }
+.lg-av { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 600; background: var(--card); color: var(--muted); flex: none; }
+.lg-people { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.lg-people > span { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px 3px 3px; border-radius: 999px; background: var(--soft); font-size: 13px; }
+.lg-people > span.adm { background: var(--warn-soft); }
+.lg-obj { display: inline-block; margin-top: 6px; padding: 4px 10px; border-radius: 10px; background: var(--soft); font-size: 13px; }
 .tag.admin { background: var(--warn-soft); color: var(--warn); }
 .admin-card { border: 1px solid var(--warn-soft); }
 

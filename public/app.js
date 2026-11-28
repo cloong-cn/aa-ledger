@@ -1863,28 +1863,56 @@ const LOG_KIND = {
   'trip.admin': ['👑', 'warn', 'set'], 'trip.rekey': ['🔗', 'warn', 'set'], 'trip.delete': ['🗑️', 'danger', 'set'], 'trip.restore': ['♻️', 'good', 'set'],
 };
 const isAdminAct = (i) => /（管理员）$/.test(i.actor) || i.actor === '管理员' || i.action === 'trip.admin' || /^重置了/.test(i.detail);
+// 把服务器写的账目描述「11/20 烤鱼 ¥360（zz乙 付，3 人分）」拆成字段
+function parseExpDesc(x) {
+  const m = /^(\d{2})\/(\d{2}) (.+) ([^\s（]+(?:（≈[^）]+）)?)（([^（）]+) 付，(\d+) 人分）$/.exec(String(x || '').trim());
+  return m ? { day: `${Number(m[1])}/${Number(m[2])}`, title: m[3], amt: m[4], payer: m[5], n: m[6] } : null;
+}
+const avatarHtml = (name) => `<span class="lg-av">${esc([...String(name)][0] || '?')}</span>`;
+function expMini(e, cls = '') {
+  return `<div class="lg-exp ${cls}"><div class="lg-exp-m"><b>${esc(e.title)}</b><span>${esc(e.day)} · ${esc(e.payer)} 付 · ${esc(e.n)} 人分</span></div><b class="lg-amt num">${esc(e.amt)}</b></div>`;
+}
+function logTime(at) {
+  const d = new Date(at), mins = Math.floor((Date.now() - d) / 60000);
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return `${mins} 分钟前`;
+  return d.toTimeString().slice(0, 5);
+}
 function logItemHtml(i) {
   const [icon, tone] = LOG_KIND[i.action] || ['•', ''];
   const adm = /（管理员）$/.test(i.actor), who = i.actor.replace(/（管理员）$/, '');
-  // 「修改了一笔：旧 → 新」拆成两行，新的那行把变了的词标出来
   // 内容本身以名字开头（如「张三 设置了密码」）时去掉，避免名字出现两次
   const det = i.detail.startsWith(who + ' ') ? i.detail.slice(who.length + 1) : i.detail;
   const k = det.indexOf('：');
-  let verb = k > 0 ? det.slice(0, k) : det, rest = k > 0 ? det.slice(k + 1) : '';
-  let body = rest ? `<div class="lg-d">${esc(rest.replace(/（\d+ 天内可在「最近删除」恢复）$/, ''))}</div>` : '';
-  if (i.action === 'expense.edit' && rest.includes(' → ')) {
-    const [a, b] = rest.split(' → ');
-    if (a === b) body = `<div class="lg-d">${esc(b)}<div class="lg-same">金额、人员没变（改了备注、分摊细节或图片）</div></div>`;
-    else {
-      const tok = (x) => x.split(/(\s+|，|（|）)/);
-      const old = new Set(tok(a));
-      body = `<div class="lg-diff"><div class="lg-old">${esc(a)}</div><div class="lg-new">${tok(b).map((w) => old.has(w) || !w.trim() ? esc(w) : `<mark>${esc(w)}</mark>`).join('')}</div></div>`;
-    }
+  let verb = k > 0 ? det.slice(0, k) : det, rest = k > 0 ? det.slice(k + 1).replace(/（\d+ 天内可在「最近删除」恢复）$/, '') : '';
+  let body = rest ? `<div class="lg-d">${esc(rest)}</div>` : '';
+  let m;
+  if (/^expense\./.test(i.action) && rest) {
+    if (i.action === 'expense.edit' && rest.includes(' → ')) {
+      const [a, b] = rest.split(' → ').map(parseExpDesc);
+      if (a && b) {
+        const F = [['day', '日期'], ['title', '名称'], ['amt', '金额'], ['payer', '谁付的'], ['n', '人数']];
+        const ch = F.filter(([f]) => a[f] !== b[f]).map(([f, n]) => `<span class="lg-ch"><i>${n}</i><s>${esc(a[f])}${f === 'n' ? ' 人' : ''}</s><span class="arr">→</span><b>${esc(b[f])}${f === 'n' ? ' 人' : ''}</b></span>`);
+        body = expMini(b) + `<div class="lg-chs">${ch.length ? ch.join('') : '<span class="lg-ch none">金额和人员没变，改的是备注、分摊方式或图片</span>'}</div>`;
+      }
+    } else { const e = parseExpDesc(rest); if (e) body = expMini(e, i.action === 'expense.remove' ? 'gone' : ''); }
+  } else if ((m = /^标记 (.+) 已转给 (.+) (\S+)$/.exec(det)) || (m = /^撤销了「(.+) 转给 (.+) (\S+)」$/.exec(det))) {
+    verb = i.action === 'payment.remove' ? '撤销了一笔转账' : '标记了一笔转账';
+    body = `<div class="lg-pay ${i.action === 'payment.remove' ? 'gone' : ''}">${avatarHtml(m[1])}<span>${esc(m[1])}</span><span class="arr">→</span>${avatarHtml(m[2])}<span>${esc(m[2])}</span><b class="lg-amt num">${esc(m[3])}</b></div>`;
+  } else if (i.action === 'trip.create' && (m = /^创建了「(.+)」，结算币种([^，]+)(?:，成员：?(.+))?$/.exec(det))) {
+    verb = '创建了这次游玩';
+    body = `<div class="lg-exp"><div class="lg-exp-m"><b>${esc(m[1])}</b><span>按${esc(m[2])}结算</span></div></div>`
+      + (m[3] ? `<div class="lg-people">${m[3].split('、').map((n) => `<span>${avatarHtml(n)}${esc(n)}</span>`).join('')}</div>` : '');
+  } else if (i.action === 'trip.admin' && (m = /交给了 (.+)$/.exec(det))) {
+    verb = '把管理员交给了';
+    body = `<div class="lg-people"><span class="adm">${avatarHtml(m[1])}${esc(m[1])} 👑</span></div>`;
+  } else if ((m = /^给「(.+) (\S+)」加了一张图$/.exec(det)) || (m = /^删除了「(.+) (\S+)」的一张图$/.exec(det))) {
+    verb = i.action === 'image.remove' ? '删了一张图' : '加了一张图';
+    body = `<div class="lg-obj">🧾 ${esc(m[1])} <b class="num">${esc(m[2])}</b></div>`;
   }
-  return `<div class="lg-item" data-cat="${LOG_KIND[i.action]?.[2] || 'set'}"${isAdminAct(i) ? ' data-adm="1"' : ''}>
+  return `<div class="lg-item" data-cat="${LOG_KIND[i.action]?.[2] || 'set'}"${adm || isAdminAct(i) ? ' data-adm="1"' : ''}>
     <span class="lg-ic ${tone}">${icon}</span>
-    <div class="lg-main"><div class="lg-t"><b>${esc(who)}</b>${adm ? '<span class="tag admin">管理员身份</span>' : ''} <span class="lg-v">${esc(verb)}</span></div>${body}</div>
-    <span class="lg-time">${new Date(i.at).toTimeString().slice(0, 5)}</span></div>`;
+    <div class="lg-main"><div class="lg-t"><b>${esc(who)}</b>${adm ? '<span class="tag admin">👑 管理员身份</span>' : ''}<span class="lg-v">${esc(verb)}</span></div><span class="lg-time">${logTime(i.at)}</span>${body}</div></div>`;
 }
 async function logSheet() {
   let items = [], more = false, cat = 'all';
@@ -1893,7 +1921,13 @@ async function logSheet() {
     let html = '', day = '';
     for (const i of list) {
       const d = new Date(i.at), ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      if (ds !== day) { if (day) html += '</div>'; day = ds; html += `<div class="lg-day">${md(ds)} ${wk(ds)}</div><div class="card lg-card">`; }
+      if (ds !== day) {
+        if (day) html += '</div>';
+        day = ds;
+        const n = list.filter((x) => new Date(x.at).toDateString() === d.toDateString()).length;
+        const rel = d.toDateString() === new Date().toDateString() ? '今天 · ' : d.toDateString() === new Date(Date.now() - 864e5).toDateString() ? '昨天 · ' : '';
+        html += `<div class="lg-day"><span>${rel}${md(ds)} ${wk(ds)}</span><span>${n} 条</span></div><div class="card lg-card">`;
+      }
       html += logItemHtml(i);
     }
     if (day) html += '</div>';
