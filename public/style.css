@@ -115,6 +115,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ========== 列表 ========== */
 .day-head { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin: 16px 4px 6px; }
+.day-head.open { width: calc(100% - 8px); border: 0; background: none; padding: 0; font: inherit; font-size: 13px; color: var(--muted); cursor: pointer; text-align: left; }
+.day-head .chev { display: inline-block; transform: rotate(90deg); margin-left: 2px; }
+.day-fold { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 8px; padding: 12px 14px; border: 0; border-radius: var(--r-lg); background: var(--card); box-shadow: var(--shadow); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.day-fold:active { background: var(--soft); }
+.day-fold .main { flex: 1; min-width: 0; }
+.day-fold .t, .day-fold .s { display: block; }
+.day-fold .t { font-weight: 500; }
+.day-fold .s { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.day-fold b { font-weight: 600; font-size: 16px; }
+.day-fold .chev, .day-head .chev { color: var(--faint); font-size: 18px; line-height: 1; }
+.link-btn { border: 0; background: none; padding: 4px 0; font: inherit; font-size: 13px; color: var(--accent); cursor: pointer; }
+.fold-all { display: flex; justify-content: flex-end; margin: 0 4px -8px; }
 .list { background: var(--card); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; }
 .item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; width: 100%; border: 0; background: none; text-align: left; }
 .item + .item { border-top: 1px solid var(--line); }

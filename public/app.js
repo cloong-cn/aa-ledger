@@ -256,7 +256,7 @@ async function route() {
     S.admin = meRes.admin; S.today = meRes.today;
   } catch (e) { $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">📡</div>${esc(e.message)}</div></div>`; return; }
   if (m) {
-    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; S.billFilter = 'all'; }
+    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; S.billFilter = 'all'; S.openDays = null; }
     return loadTrip(true);
   }
   S.trip = null; S.key = null;
@@ -637,24 +637,49 @@ function renderBills(body) {
     body.innerHTML = `<div class="empty"><div class="e">🧾</div>还没有账目<br><span class="small">谁付了钱，就点下面的「＋ 记一笔」</span></div>`;
     return;
   }
-  // 账多了（≥6 笔）才显示筛选：全部 / 我付的 / 我参与的 / 各大类（只列出用到的）
+  // 账多了（≥6 笔）才显示筛选。第一行按人：全部 / 我参与的 / 我付的 / 某某付的；第二行按大类（只列出用到的）
   let html = '', list = d.expenses;
-  if (d.expenses.length >= 6) {
-    const opts = [['all', '全部']];
-    if (S.me) opts.push(['paid', '我付的'], ['mine', '我参与的']);
-    for (const g of GROUPS) if (d.expenses.some((e) => groupOf(e.category) === g.key)) opts.push([g.key, `${g.icon} ${g.name}`]);
-    if (!opts.some(([k]) => k === S.billFilter)) S.billFilter = 'all';
-    const fl = S.billFilter || 'all';
-    list = fl === 'all' ? list : fl === 'paid' ? list.filter((e) => e.payerId === S.me)
+  const many = d.expenses.length >= 6;
+  let fl = 'all';
+  if (many) {
+    const people = [['all', '全部']];
+    if (S.me) people.push(['mine', '我参与的']);
+    const payers = d.members.filter((m) => d.expenses.some((e) => e.payerId === m.id))
+      .sort((a, b) => (b.id === S.me) - (a.id === S.me));
+    for (const m of payers) people.push([`p${m.id}`, m.id === S.me ? '我付的' : `${esc(m.name)} 付的`]);
+    const cats = [];
+    for (const g of GROUPS) if (d.expenses.some((e) => groupOf(e.category) === g.key)) cats.push([g.key, `${g.icon} ${g.name}`]);
+    if (![...people, ...cats].some(([k]) => k === S.billFilter)) S.billFilter = 'all';
+    fl = S.billFilter || 'all';
+    const pay = /^p(\d+)$/.exec(fl);
+    list = fl === 'all' ? list : pay ? list.filter((e) => e.payerId === Number(pay[1]))
       : fl === 'mine' ? list.filter((e) => e.shares.some((s) => s.memberId === S.me)) : list.filter((e) => groupOf(e.category) === fl);
-    html += `<div class="filter-row">${opts.map(([k, n]) => `<button class="chip small-chip ${fl === k ? 'on' : ''}" data-f="${k}">${n}</button>`).join('')}</div>`;
+    const chips = (o) => `<div class="filter-row">${o.map(([k, n]) => `<button class="chip small-chip ${fl === k ? 'on' : ''}" data-f="${k}">${n}</button>`).join('')}</div>`;
+    html += chips(people) + (cats.length > 1 ? chips(cats) : '');
     if (fl !== 'all') html += `<p class="muted small" style="margin:0 4px 8px">${list.length} 笔，共 <b class="num">${money(list.reduce((a, e) => a + e.cents, 0))}</b>${fl === 'mine' ? `，我的部分 <b class="num">${money(list.reduce((a, e) => a + (e.shares.find((s) => s.memberId === S.me)?.cents || 0), 0))}</b>` : ''}</p>`;
   }
   const groups = new Map();
   for (const e of list) { if (!groups.has(e.day)) groups.set(e.day, []); groups.get(e.day).push(e); }
+  // 按天折叠：账多（≥6 笔）、不筛选、不止一天时，只展开最近一天，其他天收成一行摘要，点开看明细
+  const fold = many && fl === 'all' && groups.size > 1;
+  if (fold) {
+    if (!S.openDays) S.openDays = new Set([[...groups.keys()][0]]);
+    if (S.flashExp) { const fe = d.expenses.find((e) => e.id === S.flashExp); if (fe) S.openDays.add(fe.day); }
+    const allOpen = [...groups.keys()].every((k) => S.openDays.has(k));
+    html += `<div class="fold-all"><button class="link-btn" data-foldall="${allOpen ? 0 : 1}">${allOpen ? '全部收起' : '全部展开'}</button></div>`;
+  }
   for (const [day, list] of groups) {
     const sum = list.reduce((a, e) => a + e.cents, 0);
-    html += `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
+    if (fold && !S.openDays.has(day)) {
+      const who = [...new Set(list.map((e) => nameOf(e.payerId)))];
+      html += `<button class="day-fold" data-day="${day}"><span class="main"><span class="t">${md(day)} ${wk(day)}</span>
+        <span class="s">${list.length} 笔 · ${esc(who.slice(0, 3).join('、'))}${who.length > 3 ? ` 等 ${who.length} 人` : ''}付</span></span>
+        <b class="num">${money(sum)}</b><span class="chev" aria-hidden="true">›</span></button>`;
+      continue;
+    }
+    html += fold
+      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button><div class="list">`
+      : `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
       const sub = `${e.currency !== BASE ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
@@ -667,6 +692,12 @@ function renderBills(body) {
   body.innerHTML = html;
   body.querySelectorAll('[data-exp]').forEach((b) => b.onclick = () => expenseDetail(Number(b.dataset.exp)));
   body.querySelectorAll('[data-f]').forEach((b) => b.onclick = () => { S.billFilter = b.dataset.f; renderBills(body); });
+  body.querySelectorAll('[data-day]').forEach((b) => b.onclick = () => {
+    const k = b.dataset.day; S.openDays.has(k) ? S.openDays.delete(k) : S.openDays.add(k); renderBills(body);
+  });
+  body.querySelectorAll('[data-foldall]').forEach((b) => b.onclick = () => {
+    S.openDays = new Set(b.dataset.foldall === '1' ? groups.keys() : []); renderBills(body);
+  });
   if (S.flashExp) { const id = S.flashExp; S.flashExp = null; requestAnimationFrame(() => flash(`[data-exp="${id}"]`)); }
 }
 
