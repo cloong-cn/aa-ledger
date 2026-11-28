@@ -91,6 +91,9 @@ r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: Buffe
 ok('伪造图片被拒', r.status === 400);
 r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/svg+xml' });
 ok('svg 类型被拒', r.status === 415);
+{ const big = Buffer.concat([PNG, Buffer.alloc(5 * 1024 * 1024 + 1 - PNG.length)]);
+  const s = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: big }).then((x) => x.status, () => 413);
+  ok('超过 5MB 被拒', s === 413, s); }
 r = await call('GET', `/api/t/${key}/images/${IMG}`);
 ok('读取图片', r.status === 200 && r.ct === 'image/png' && Buffer.compare(r.data, PNG) === 0);
 // 收款码

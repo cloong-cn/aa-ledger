@@ -14,7 +14,10 @@ const HOST = '127.0.0.1';
 const TZ = 'Asia/Shanghai';
 const SESSION_DAYS = 30;
 const UPLOADS = process.env.UPLOADS || '/srv/aa/uploads';
-const MAX_IMAGE = 6 * 1024 * 1024;
+const MB = 1024 * 1024;
+const MAX_IMAGE = 5 * MB;                                         // 单张图片上限（网页会先压缩，正常只有几百 KB）
+const TRIP_IMAGE_QUOTA = Number(process.env.TRIP_IMAGE_QUOTA_MB || 100) * MB;  // 每次游玩的截图总量（含最近删除）
+const MIN_FREE_DISK = Number(process.env.MIN_FREE_DISK_MB || 2048) * MB;       // 磁盘剩余低于这个数就拒绝上传
 const MAX_IMAGES_PER_EXPENSE = 9;
 const MAX_CENTS = 1e9;          // 单笔上限（数据库 int 列能放下 21 亿分）
 const TRASH_DAYS = 30;         // 删除的东西保留多少天
@@ -152,6 +155,21 @@ function saveImage(buf) {
   const file = `${crypto.randomBytes(16).toString('hex')}.${t.ext}`;
   fs.writeFileSync(path.join(UPLOADS, file), buf, { mode: 0o640 });
   return { file, mime: t.mime, bytes: buf.length };
+}
+// 磁盘剩余空间不够就拒绝上传，免得把服务器写满
+function assertDiskRoom() {
+  let free;
+  try { const st = fs.statfsSync(UPLOADS); free = st.bavail * st.bsize; } catch { return; }
+  if (free < MIN_FREE_DISK) throw new HttpError(507, '服务器空间不足，暂时不能上传图片，请联系管理员');
+}
+// 这次游玩已占用的截图字节数：现有截图 + 最近删除里还没清掉的截图
+async function tripImageBytes(q, tripId) {
+  const { rows: [r] } = await q.query(`SELECT
+      (SELECT coalesce(sum(i.bytes),0) FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1)
+    + (SELECT coalesce(sum((t.data->'image'->>'bytes')::bigint),0) FROM trash t WHERE t.trip_id=$1 AND t.kind='image')
+    + (SELECT coalesce(sum((x->>'bytes')::bigint),0) FROM trash t, jsonb_array_elements(t.data->'images') x WHERE t.trip_id=$1 AND t.kind='expense')
+    AS n`, [tripId]);
+  return Number(r.n);
 }
 function removeFiles(files) {
   for (const f of files) if (/^[a-f0-9]{32}\.(jpg|png|webp)$/.test(f)) fs.unlink(path.join(UPLOADS, f), () => {});
@@ -675,6 +693,8 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
     const e = await loadExpense(q, trip, params.id);
     const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
     if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`每笔最多 ${MAX_IMAGES_PER_EXPENSE} 张图`);
+    if (await tripImageBytes(q, trip.id) + img.bytes > TRIP_IMAGE_QUOTA)
+      throw bad(`这次游玩的截图已满 ${TRIP_IMAGE_QUOTA / MB}MB（含最近删除），删掉一些再传`);
     const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes) VALUES($1,$2,$3,$4) RETURNING id`, [e.id, img.file, img.mime, img.bytes]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtMoney(trip.base_currency, e.cents)}」加了一张图`);
     return { id: r.id };
@@ -1118,7 +1138,7 @@ function readBody(req, limit) {
     let size = 0; const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(new HttpError(413, limit > 100000 ? '图片太大（最大 6MB）' : '请求太大')); req.destroy(); } else chunks.push(c);
+      if (size > limit) { reject(new HttpError(413, limit > 100000 ? `图片太大（最大 ${MAX_IMAGE / MB}MB）` : '请求太大')); req.destroy(); } else chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
@@ -1143,6 +1163,7 @@ const server = http.createServer(async (req, res) => {
     let body = {}, rawBody = null;
     if (r.raw) {
       if (!/^image\/(jpeg|png|webp)$/.test(String(req.headers['content-type'] || ''))) throw new HttpError(415, '只接受图片');
+      assertDiskRoom();
       rawBody = await readBody(req, MAX_IMAGE);
       if (!rawBody.length) throw bad('图片是空的');
     } else if (req.method !== 'GET' && req.method !== 'DELETE') {

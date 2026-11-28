@@ -216,6 +216,7 @@ git clone /srv/aa/backups/code-YYYYMMDD.bundle /srv/aa/app-restored
 - **仓库是公开的**：不要提交真实域名、服务器 IP、密码、`.env`、数据库导出、截图或任何真实账目数据（测试只用 zz 开头的假数据）。提交前可以跑 `git grep -nE '<真实域名>|<服务器IP>'` 检查一遍。
 
 - **分享链接 = 这次游玩的全部权限**。密钥是 128 位随机数。nginx 设了 `Referrer-Policy: same-origin`，避免链接通过 Referer 泄露，不要去掉。
+- **上传限制（防止把磁盘写满）**：网页上传前会先压缩（宽 ≤1200、高 ≤2800，转 JPEG）。服务器再兜底三道：单张最大 5MB（nginx `client_max_body_size 6m` + `server.js` 的 `MAX_IMAGE`）；每次游玩的截图总量（含最近删除）最多 100MB（环境变量 `TRIP_IMAGE_QUOTA_MB`）；磁盘剩余不足 2GB 时拒绝一切上传，返回 507（环境变量 `MIN_FREE_DISK_MB`）。
 - **CSRF 防护**：修改类接口只接受 `application/json`，上传图片只接受 `image/*`，并且会检查文件头。新增接口时也要遵守。
 - **登录和邀请码**都有错误次数限制：nginx 的 `aa_login` 限速，加上 `login_fails` 表。
 - **管理员会话**：数据库里只存 token 的 SHA-256；密码用 scrypt 加盐哈希。
