@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS images (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS images_expense ON images(expense_id);
+ALTER TABLE images ADD COLUMN IF NOT EXISTS note text NOT NULL DEFAULT '';   -- 图片备注（最多 200 字）
 
 -- 结算时的转账（标记"已转"）
 CREATE TABLE IF NOT EXISTS payments (

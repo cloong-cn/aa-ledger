@@ -96,6 +96,9 @@ ok('svg 类型被拒', r.status === 415);
   ok('超过 5MB 被拒', s === 413, s); }
 r = await call('GET', `/api/t/${key}/images/${IMG}`);
 ok('读取图片', r.status === 200 && r.ct === 'image/png' && Buffer.compare(r.data, PNG) === 0);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '  团购券截图 ' }); ok('图片备注', r.status === 200);
+r = await call('GET', `/api/t/${key}`); ok('备注出现在账目里', r.data.expenses.find((e) => e.id === E1).imageNotes[IMG] === '团购券截图', JSON.stringify(r.data.expenses.find((e) => e.id === E1).imageNotes));
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '字'.repeat(201) }); ok('备注超长被拒', r.status === 400);
 // 收款码
 r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png' }); ok('上传收款码', r.status === 200);
 r = await call('GET', `/api/t/${key}`); ok('收款码标记', !!r.data.members.find((m) => m.id === B).codes.wechat);

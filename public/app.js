@@ -170,43 +170,168 @@ function confirmSheet(title, text, okText = '确定', danger = false) {
 }
 
 const $viewer = document.getElementById('viewer');
-// 看大图：srcs 是同一组的所有图，可以左右滑动 / 点两边箭头 / 键盘 ← → 切换；点图片或 ✕ 关闭
-function viewImage(srcs, index = 0) {
-  if (!Array.isArray(srcs)) srcs = [srcs];
-  const many = srcs.length > 1;
-  $viewer.innerHTML = `<div class="track">${srcs.map((u) => `<div class="slide"><img src="${esc(u)}" alt="图片" draggable="false"></div>`).join('')}</div>
+// 看大图。items：同一组的所有图，每项是网址字符串，或 { src, id, note }。
+// 切换：左右滑 / 点底部缩略图 / 电脑上点两边箭头或按 ← →。
+// 放大：双指捏合、双击（电脑上双击或滚轮），放大后单指拖动；缩回原大小才能左右滑。
+// 关闭：✕、点图片外的黑色区域、Esc。
+// opts.saveNote(id, note)：传了就能编辑图片备注（保存成功返回新备注）。
+const V = { items: [], i: 0, opts: {}, z: null };
+function viewImage(items, index = 0, opts = {}) {
+  V.items = (Array.isArray(items) ? items : [items]).map((x) => typeof x === 'string' ? { src: x } : x);
+  V.i = index; V.opts = opts;
+  const many = V.items.length > 1;
+  $viewer.innerHTML = `<div class="track">${V.items.map((x) => `<div class="slide"><img src="${esc(x.src)}" alt="图片" draggable="false"></div>`).join('')}</div>
     ${many ? `<div class="count"></div><button class="nav prev" data-step="-1" aria-label="上一张">‹</button><button class="nav next" data-step="1" aria-label="下一张">›</button>` : ''}
+    <div class="vbottom"><div class="caption"></div>
+      ${many ? `<div class="strip">${V.items.map((x, i) => `<button class="sthumb" data-go="${i}" aria-label="第 ${i + 1} 张"><img src="${esc(x.src)}" alt="" loading="lazy"></button>`).join('')}</div>` : ''}</div>
     <button class="icon-btn close" aria-label="关闭">✕</button>`;
   $viewer.hidden = false;
   const track = $viewer.querySelector('.track');
   track.scrollLeft = index * track.clientWidth;
-  if (many) {
-    const sync = () => {
-      const i = Math.round(track.scrollLeft / track.clientWidth);
-      $viewer.querySelector('.count').textContent = `${i + 1} / ${srcs.length}`;
-      $viewer.querySelector('.prev').hidden = i === 0;
-      $viewer.querySelector('.next').hidden = i === srcs.length - 1;
-    };
-    track.addEventListener('scroll', sync, { passive: true });
-    sync();
+  track.addEventListener('scroll', () => {
+    const i = Math.round(track.scrollLeft / track.clientWidth);
+    if (i !== V.i) { V.i = i; viewerSync(); }
+  }, { passive: true });
+  viewerSync();
+  zoomBind(track);
+}
+function viewerSync() {
+  const n = V.items.length, x = V.items[V.i];
+  if (n > 1) {
+    $viewer.querySelector('.count').textContent = `${V.i + 1} / ${n}`;
+    $viewer.querySelector('.prev').hidden = V.i === 0;
+    $viewer.querySelector('.next').hidden = V.i === n - 1;
+    $viewer.querySelectorAll('.sthumb').forEach((b, i) => b.classList.toggle('on', i === V.i));
+    $viewer.querySelector('.sthumb.on')?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
   }
+  zoomReset();
+  const cap = $viewer.querySelector('.caption');
+  const can = V.opts.saveNote && x.id;
+  cap.innerHTML = x.note ? `<p class="ctext">${esc(x.note)}</p>${can ? '<button class="cedit" data-note="1">✎ 改备注</button>' : ''}`
+    : can ? '<button class="cedit" data-note="1">✎ 加备注</button>' : '';
 }
-function viewerStep(d) {
+function viewerNoteEdit() {
+  const x = V.items[V.i], cap = $viewer.querySelector('.caption');
+  cap.innerHTML = `<div class="cform"><textarea maxlength="200" rows="2" placeholder="比如：这张是团购券；左边是小票">${esc(x.note || '')}</textarea>
+    <div class="cbtns"><button class="btn small" data-ncancel="1">取消</button><button class="btn primary small" data-nsave="1">保存</button></div></div>`;
+  const ta = cap.querySelector('textarea'); ta.focus();
+  cap.querySelector('[data-ncancel]').onclick = (e) => { e.stopPropagation(); viewerSync(); };
+  cap.querySelector('[data-nsave]').onclick = async (e) => {
+    e.stopPropagation(); e.target.disabled = true;
+    try { x.note = await V.opts.saveNote(x.id, ta.value.trim()); toast('备注已保存'); viewerSync(); }
+    catch (err) { toast(err.message, true); e.target.disabled = false; }
+  };
+}
+function viewerGo(i) {
   const track = $viewer.querySelector('.track');
-  if (track) track.scrollBy({ left: d * track.clientWidth, behavior: 'smooth' });
+  if (track && i >= 0 && i < V.items.length) track.scrollTo({ left: i * track.clientWidth, behavior: 'smooth' });
 }
-function closeViewer() { $viewer.hidden = true; $viewer.innerHTML = ''; }
+const viewerStep = (d) => viewerGo(V.i + d);
+function closeViewer() { $viewer.hidden = true; $viewer.innerHTML = ''; V.z = null; }
 $viewer.addEventListener('click', (e) => {
-  const nav = e.target.closest('[data-step]');
-  if (nav) return viewerStep(Number(nav.dataset.step));
-  closeViewer();
+  if (V.z?.moved) { V.z.moved = false; return; }
+  const t = e.target;
+  if (t.closest('[data-step]')) return viewerStep(Number(t.closest('[data-step]').dataset.step));
+  if (t.closest('[data-go]')) return viewerGo(Number(t.closest('[data-go]').dataset.go));
+  if (t.closest('[data-note]')) return viewerNoteEdit();
+  if (t.closest('.close') || t.classList.contains('slide') || t.classList.contains('track')) return closeViewer();
 });
 document.addEventListener('keydown', (e) => {
-  if (!$viewer.hidden && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return viewerStep(e.key === 'ArrowLeft' ? -1 : 1);
+  if (!$viewer.hidden && e.target.tagName !== 'TEXTAREA' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return viewerStep(e.key === 'ArrowLeft' ? -1 : 1);
   if (e.key !== 'Escape') return;
   if (!$viewer.hidden) return closeViewer();
   if (!$sheet.hidden) closeSheet();
 });
+
+// ----- 看大图：缩放 -----
+// 当前这张图的 { img, s 倍数, x/y 平移, base 原始位置 }。图片用 transform 放大，左上角为原点。
+function zoomReset() {
+  const img = $viewer.querySelectorAll('.slide img')[V.i];
+  $viewer.querySelectorAll('.slide img').forEach((im) => { im.style.transform = ''; });
+  $viewer.classList.remove('zoomed');
+  V.z = { img, s: 1, x: 0, y: 0, moved: false };
+}
+function zoomApply(s, x, y) {
+  const z = V.z, b = z.base || (z.base = z.img.getBoundingClientRect());
+  const vw = innerWidth, vh = innerHeight, w = b.width * s, h = b.height * s;
+  // 放大后不让图片边缘离开屏幕；比屏幕小的方向保持居中
+  x = w <= vw ? (vw - w) / 2 - b.left : Math.min(-b.left, Math.max(vw - b.left - w, x));
+  y = h <= vh ? (vh - h) / 2 - b.top : Math.min(-b.top, Math.max(vh - b.top - h, y));
+  Object.assign(z, { s, x, y });
+  z.img.style.transform = s === 1 ? '' : `translate(${x}px, ${y}px) scale(${s})`;
+  $viewer.classList.toggle('zoomed', s > 1);
+}
+// 以屏幕上 (px, py) 这个点为中心缩放到 s 倍
+function zoomAt(s, px, py, from = V.z) {
+  s = Math.min(5, Math.max(1, s));
+  const b = V.z.base || (V.z.base = V.z.img.getBoundingClientRect());
+  const ux = (px - b.left - from.x) / from.s, uy = (py - b.top - from.y) / from.s;
+  zoomApply(s, px - b.left - ux * s, py - b.top - uy * s);
+}
+function zoomBind(track) {
+  let g = null, lastTap = 0, lastTouch = 0;
+  track.addEventListener('gesturestart', (e) => e.preventDefault());   // iOS：不让整个页面跟着缩放
+  const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  const mid = (t) => [(t[0].clientX + t[1].clientX) / 2, (t[0].clientY + t[1].clientY) / 2];
+  track.addEventListener('touchstart', (e) => {
+    lastTouch = Date.now();
+    if (!e.target.closest('.slide img') && V.z.s === 1) return;
+    const t = e.touches, z = V.z;
+    if (z.s === 1) z.base = null;
+    if (t.length === 2) { const [mx, my] = mid(t); g = { pinch: true, d: dist(t), mx, my, from: { s: z.s, x: z.x, y: z.y } }; }
+    else if (t.length === 1) g = { pinch: false, sx: t[0].clientX, sy: t[0].clientY, from: { s: z.s, x: z.x, y: z.y } };
+  }, { passive: true });
+  track.addEventListener('touchmove', (e) => {
+    if (!g) return;
+    const t = e.touches, z = V.z;
+    if (g.pinch && t.length === 2) {
+      e.preventDefault(); z.moved = true;
+      const [mx, my] = mid(t);
+      zoomAt(g.from.s * dist(t) / g.d, g.mx, g.my, g.from);
+      zoomApply(z.s, z.x + mx - g.mx, z.y + my - g.my);
+    } else if (!g.pinch && t.length === 1 && z.s > 1) {
+      e.preventDefault(); z.moved = true;
+      zoomApply(z.s, g.from.x + t[0].clientX - g.sx, g.from.y + t[0].clientY - g.sy);
+    }
+  }, { passive: false });
+  track.addEventListener('touchend', (e) => {
+    if (!g) return;
+    const z = V.z;
+    if (!g.pinch && e.changedTouches.length === 1 && !z.moved) {
+      // 双击：在 300ms 内点两下同一处
+      const now = Date.now(), c = e.changedTouches[0];
+      if (now - lastTap < 300) {
+        e.preventDefault();
+        if (z.s > 1) zoomApply(1, 0, 0); else { z.base = null; zoomAt(2.5, c.clientX, c.clientY); }
+        lastTap = 0;
+      } else lastTap = now;
+    }
+    if (z.s < 1.05) zoomApply(1, 0, 0);
+    if (!e.touches.length) { g = null; setTimeout(() => { if (V.z) V.z.moved = false; }, 0); }
+    else if (e.touches.length === 1 && z.s > 1) g = { pinch: false, sx: e.touches[0].clientX, sy: e.touches[0].clientY, from: { s: z.s, x: z.x, y: z.y } };
+  });
+  // 电脑：双击放大 / 还原，滚轮缩放，放大后按住拖动
+  track.addEventListener('dblclick', (e) => {
+    if (!e.target.closest('.slide img') || Date.now() - lastTouch < 1000) return;   // 手机上已经在 touchend 里处理过
+    const z = V.z;
+    if (z.s > 1) zoomApply(1, 0, 0); else { z.base = null; zoomAt(2.5, e.clientX, e.clientY); }
+  });
+  track.addEventListener('wheel', (e) => {
+    if (!e.target.closest('.slide img') && V.z.s === 1) return;
+    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;   // 触控板横向滑动 = 切换图片
+    e.preventDefault();
+    if (V.z.s === 1) V.z.base = null;
+    zoomAt(V.z.s * Math.exp(-e.deltaY / 300), e.clientX, e.clientY);
+  }, { passive: false });
+  track.addEventListener('mousedown', (e) => {
+    const z = V.z; if (z.s === 1 || e.button !== 0) return;
+    e.preventDefault();
+    const sx = e.clientX, sy = e.clientY, fx = z.x, fy = z.y;
+    const mv = (m) => { z.moved = true; zoomApply(z.s, fx + m.clientX - sx, fy + m.clientY - sy); };
+    const up = () => { removeEventListener('mousemove', mv); removeEventListener('mouseup', up); setTimeout(() => { z.moved = false; }, 0); };
+    addEventListener('mousemove', mv); addEventListener('mouseup', up);
+  });
+}
 
 // 图片压缩：长截图保留清晰度（宽 ≤1200、高 ≤2800），转成 JPEG
 async function compressImage(file) {
@@ -711,7 +836,8 @@ function exactNote(e) {
 function expenseDetail(id) {
   const e = T().expenses.find((x) => x.id === id);
   if (!e) return;
-  const imgs = e.images.map((i) => `<button class="thumb" data-img="${i}"><img src="/api/t/${S.key}/images/${i}" alt="截图" loading="lazy"></button>`).join('');
+  const notes = e.imageNotes || {};
+  const imgs = e.images.map((i) => `<button class="thumb" data-img="${i}"><img src="/api/t/${S.key}/images/${i}" alt="截图" loading="lazy">${notes[i] ? `<span class="tnote">${esc(notes[i])}</span>` : ''}</button>`).join('');
   const mode = e.shares.some((s) => s.fixed != null) ? '含指定金额' : e.shares.every((s) => s.weight === e.shares[0].weight) ? '平均分' : '按份数';
   openSheet(`${sheetHead(e.title || CAT[e.category].name)}
     <div style="font-size:32px;font-weight:700;margin:-6px 0 ${e.currency !== BASE ? 0 : 10}px" class="num">${curMoney(e.currency, e.origCents)}</div>
@@ -730,7 +856,9 @@ function expenseDetail(id) {
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
     <p class="faint tiny" style="margin:14px 2px">${esc(e.createdBy || '未署名')} 记于 ${fmtTime(e.createdAt)}${e.updatedAt && new Date(e.updatedAt) - new Date(e.createdAt) > 2000 ? ` · 修改于 ${fmtTime(e.updatedAt)}` : ''}</p>
     ${editable() ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>` : ''}`, (el) => {
-    el.querySelectorAll('[data-img]').forEach((b, i, all) => b.onclick = () => viewImage([...all].map((x) => `/api/t/${S.key}/images/${x.dataset.img}`), i));
+    el.querySelectorAll('[data-img]').forEach((b, i) => b.onclick = () => viewImage(
+      e.images.map((id) => ({ src: `/api/t/${S.key}/images/${id}`, id, note: notes[id] || '' })), i,
+      editable() ? { saveNote: async (id, note) => { await api('PATCH', `/api/t/${S.key}/images/${id}`, { note }); await refresh(); if (!$sheet.hidden) expenseDetail(e.id); return note; } } : {}));
     const del = el.querySelector('#ed-del');
     if (del) del.onclick = async () => {
       if (!(await confirmSheet('删除这笔账？', `${esc(e.title || CAT[e.category].name)} ${money(e.cents)}，连同截图一起删除。30 天内可以在「成员 → 最近删除」里恢复。`, '删除', true))) return expenseDetail(id);
