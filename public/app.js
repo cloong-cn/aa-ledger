@@ -821,7 +821,10 @@ function setMe(id, token) {
   if (token !== undefined) store.set(tokKey(), token ? JSON.stringify({ id, t: token }) : null);
 }
 // 只有记账人（创建人）和管理员能改；登录了管理员的手机都能改
-const canOwn = (owner) => !!S.admin || (!!S.me && !!owner && nameOf(S.me) === owner);
+// 这次游玩的管理员（成员）：必须设了密码、这台手机输过密码，权限才生效（服务器也是这么判断的）
+const isTripAdminMe = () => !!(S.me && T().trip.adminId === S.me && member(S.me)?.hasPin && myToken());
+const canManage = () => !!S.admin || isTripAdminMe();
+const canOwn = (owner) => canManage() || (!!S.me && !!owner && nameOf(S.me) === owner);
 // 输 4 位数字的弹窗。取消 / 关掉返回 null
 function pinSheet(title, text, err = '') {
   return new Promise((resolve) => {
@@ -986,7 +989,7 @@ function exactNote(e) {
 }
 // 图片备注：只有传图的人（旧图按这笔账的记账人）和管理员能改
 function canNote(e, imgId) {
-  if (S.admin) return true;
+  if (canManage()) return true;
   const owner = (e.imageBy || {})[imgId] || e.createdBy;
   return !!(S.me && owner && owner !== '未署名' && nameOf(S.me) === owner);
 }
@@ -1593,10 +1596,14 @@ function renderStats(body) {
 function renderPeople(body) {
   const d = T(), t = d.trip;
   const ed = editable();
-  let html = `<div class="list">${d.members.map((m) => {
+  let html = '';
+  // 我是管理员但还没设密码：提醒（不设密码，别人就能冒充管理员）
+  if (S.me && t.adminId === S.me && !member(S.me)?.hasPin) html += `<div class="banner warn">👑<span class="sp">你是这次的管理员。设个密码后管理员权限才生效，也防止别人冒充你。</span><button class="btn small" id="pm-setpin">设密码</button></div>`;
+  if (!t.adminId && S.admin) html += `<div class="banner lock">👑<span class="sp">这次游玩还没有管理员，点成员可以指定一个（网站管理员一直都有全部权限）</span></div>`;
+  html += `<div class="list">${d.members.map((m) => {
     const codes = [m.codes.wechat && '微信', m.codes.alipay && '支付宝'].filter(Boolean);
     return `<div class="mem"><span class="avatar">${esc([...m.name][0])}</span>
-      <span class="main"><b>${esc(m.name)}</b>${m.id === S.me ? ' <span class="tag ink">我</span>' : ''}${m.weight !== 1 ? ` <span class="tag">${m.weight} 份</span>` : ''}
+      <span class="main"><b>${esc(m.name)}</b>${m.id === S.me ? ' <span class="tag ink">我</span>' : ''}${m.id === t.adminId ? ' <span class="tag admin">👑 管理员</span>' : ''}${m.hasPin ? ' <span class="faint small">🔒</span>' : ''}${m.weight !== 1 ? ` <span class="tag">${m.weight} 份</span>` : ''}
         <div class="s">${codes.length ? `收款码：${codes.join('、')}` : '还没有收款码'}</div></span>
       <button class="btn small" data-mem="${m.id}">${ed ? '设置' : '查看'}</button></div>`;
   }).join('') || '<div class="empty small">还没有成员</div>'}</div>`;
@@ -1610,10 +1617,14 @@ function renderPeople(body) {
       ${Object.keys(d.rates).length ? Object.entries(d.rates).sort().map(([c, r]) => `<button class="item" data-rate="${c}"><span class="cat">💱</span><span class="main"><span class="t">汇率：1 ${CUR[c]?.name || c} = ${fmtRate(r.rate)} ${BN()}</span><span class="s">${d.fx?.rates?.[c] ? `今日市场 ${fmtRate(d.fx.rates[c])}` : '本次游玩统一按这个汇率折算'}${ed ? ' · 点击修改' : ''}</span></span></button>`).join('') : ''}
       <a class="item" id="pm-export" href="/api/t/${esc(S.key)}/export" download><span class="cat">📑</span><span class="main"><span class="t">导出 Excel</span><span class="s">账目明细、每人汇总、转账记录</span></span></a>
       <button class="item" id="pm-trash"><span class="cat">🗑️</span><span class="main"><span class="t">最近删除</span><span class="s">误删的账目和截图 30 天内可以恢复</span></span></button>
-      <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔</span></span></button>
+      <button class="item" id="pm-log"><span class="cat">🕘</span><span class="main"><span class="t">操作记录</span><span class="s">谁在什么时候记了、改了、删了哪一笔，所有人都能看</span></span></button>
       ${ed ? '<button class="item" id="pm-lock"><span class="cat">🔒</span><span class="main"><span class="t">锁定账单</span><span class="s">结清后锁定，防止误改</span></span></button>' : ''}
     </div>
     ${t.note ? `<div class="section-title"><span>说明</span></div><div class="note-box">${esc(t.note)}</div>` : ''}`;
+  if (!d.isAdmin && isTripAdminMe() && t.locked) {
+    html += `<div class="section-title"><span>管理员</span></div><div class="list">
+      <button class="item" id="pa-unlock"><span class="cat">🔓</span><span class="main"><span class="t">解锁账单</span><span class="s">解锁后大家可以继续修改</span></span></button></div>`;
+  }
   if (d.isAdmin) {
     html += `<div class="section-title"><span>管理员</span></div><div class="list">
       ${t.locked ? '<button class="item" id="pa-unlock"><span class="cat">🔓</span><span class="main"><span class="t">解锁账单</span><span class="s">解锁后大家可以继续修改</span></span></button>' : ''}
@@ -1634,6 +1645,7 @@ function renderPeople(body) {
   }
   body.querySelector('#pm-share').onclick = () => shareLink(false);
   body.querySelector('#pm-log').onclick = logSheet;
+  const sp = body.querySelector('#pm-setpin'); if (sp) sp.onclick = setPin;
   body.querySelector('#pm-trash').onclick = trashSheet;
   if (ed && !d.payments.length) body.querySelector('#pm-base').onclick = baseSheet;
   if (ed) body.querySelectorAll('[data-rate]').forEach((b) => b.onclick = () => rateSheet(b.dataset.rate));
@@ -1739,10 +1751,11 @@ function memberSheet(id) {
   const m = member(id); if (!m) return;
   const ed = editable();
   const self = S.me === id && (!m.hasPin || !!myToken());
+  const mgr = canManage(), isAdm = T().trip.adminId === id;
   const b = balOf(id);
   const codeRow = (k, n) => `<div class="kv" style="align-items:center"><span>${n}收款码</span><span>
     ${m.codes[k] ? `<button class="btn small" data-view="${k}">查看</button>` : '<span class="faint small">未上传</span>'}
-    ${ed && (self || S.admin) ? `<button class="btn small" data-up="${k}">${m.codes[k] ? '更换' : '上传'}</button>${m.codes[k] ? `<button class="btn small danger" data-rm="${k}">删除</button>` : ''}` : ''}</span></div>`;
+    ${ed && (self || mgr) ? `<button class="btn small" data-up="${k}">${m.codes[k] ? '更换' : '上传'}</button>${m.codes[k] ? `<button class="btn small danger" data-rm="${k}">删除</button>` : ''}` : ''}</span></div>`;
   openSheet(`${sheetHead(m.name)}
     <div class="card">
       <div class="kv"><span>垫付</span><span class="num">${money(b.paid)}</span></div>
@@ -1750,11 +1763,14 @@ function memberSheet(id) {
       <div class="kv"><span>结果</span><span class="num">${b.net > 0 ? `<span class="pos">应收 ${money(b.net)}</span>` : b.net < 0 ? `<span class="neg">应付 ${money(-b.net)}</span>` : '已结清'}</span></div>
     </div>
     <div class="card">${codeRow('wechat', '微信')}${codeRow('alipay', '支付宝')}
-      <p class="faint tiny" style="margin:8px 0 0">收款码跟着人走，以后的游玩也能直接用${self || S.admin ? '' : `；只有 ${esc(m.name)} 本人能上传`}</p></div>
+      <p class="faint tiny" style="margin:8px 0 0">收款码跟着人走，以后的游玩也能直接用${self || mgr ? '' : `；只有 ${esc(m.name)} 本人能上传`}</p></div>
+    ${isAdm ? `<div class="card admin-card"><div class="kv"><span>👑 这次游玩的管理员</span></div>
+      <p class="faint tiny" style="margin:6px 0 0">能改所有人的账、重置密码、解锁账单。用管理员身份做的修改，操作记录里会标出来，所有人都能看到。${self && !m.hasPin ? '<br><b style="color:var(--warn)">你还没设密码，管理员权限暂时不生效。</b>' : ''}</p></div>`
+      : mgr ? `<button class="btn ghost block" id="ms-admin" style="margin-bottom:12px">👑 把管理员交给 ${esc(m.name)}</button>` : ''}
     ${self ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 密码${m.hasPin ? '<span class="tag">已设置</span>' : ''}</span><span>
         <button class="btn small" id="ms-pin">${m.hasPin ? '修改' : '设置'}</button>${m.hasPin ? '<button class="btn small danger" id="ms-unpin">取消</button>' : ''}</span></div>
         <p class="faint tiny" style="margin:8px 0 0">设了密码，别人就不能在他的手机上冒充你改账</p></div>`
-      : S.admin && m.hasPin ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 ${esc(m.name)} 设了密码</span><button class="btn small danger" id="ms-reset">重置</button></div>
+      : mgr && m.hasPin ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 ${esc(m.name)} 设了密码</span><button class="btn small danger" id="ms-reset">重置</button></div>
         <p class="faint tiny" style="margin:8px 0 0">TA 忘了密码时用。重置后 TA 选「我是谁」就不用输密码了，可以再设新的</p></div>` : ''}
     ${ed ? `<div class="card"><div class="field" style="margin:0"><label>默认份数（带家属可以填 2；记账时可以单独改）</label>
       <div class="row2"><input class="input" id="ms-w" inputmode="decimal" value="${m.weight}"><button class="btn" id="ms-save" style="flex:none">保存</button></div></div></div>
@@ -1798,6 +1814,12 @@ function memberSheet(id) {
       try { await api('DELETE', `/api/t/${S.key}/members/${id}/pin`); setMe(id, null); toast('已取消密码'); await refresh(); }
       catch (e) { toast(e.message, true); }
     };
+    const ad = el.querySelector('#ms-admin');
+    if (ad) ad.onclick = async () => {
+      if (!(await confirmSheet(`把管理员交给 ${esc(m.name)}？`, `交出去以后你就不是管理员了。${m.hasPin ? '' : `${esc(m.name)} 还没设密码，TA 设了密码以后管理员权限才生效。`}`, '交给 TA'))) return;
+      try { await api('PUT', `/api/t/${S.key}/admin`, { memberId: id }); closeSheet(); toast(`管理员已交给 ${m.name}`); await refresh(); }
+      catch (e) { toast(e.message, true); }
+    };
     const rs = el.querySelector('#ms-reset');
     if (rs) rs.onclick = async () => {
       if (!(await confirmSheet(`重置 ${esc(m.name)} 的密码？`, 'TA 所有手机上记住的密码都会失效。', '重置', true))) return;
@@ -1830,12 +1852,72 @@ async function trashSheet() {
     });
   });
 }
+// 操作记录：按天分组，每条有图标、谁、做了什么、时间；修改前后对比；用管理员身份做的标出来
+const LOG_KIND = {
+  'expense.add': ['➕', 'good', 'bill'], 'expense.edit': ['✏️', 'accent', 'bill'], 'expense.remove': ['🗑️', 'danger', 'bill'], 'expense.restore': ['♻️', 'good', 'bill'],
+  'image.add': ['🖼️', '', 'bill'], 'image.remove': ['🖼️', 'danger', 'bill'], 'image.restore': ['♻️', 'good', 'bill'], 'image.note': ['📝', '', 'bill'],
+  'payment.add': ['💸', 'good', 'pay'], 'payment.remove': ['↩️', 'warn', 'pay'],
+  'member.add': ['👤', '', 'set'], 'member.edit': ['👤', '', 'set'], 'member.remove': ['👤', 'danger', 'set'], 'member.pin': ['🔑', '', 'set'],
+  'paycode.set': ['💳', '', 'set'], 'paycode.remove': ['💳', 'danger', 'set'], 'rate.set': ['💱', '', 'set'], 'rate.edit': ['💱', 'accent', 'set'],
+  'trip.create': ['🎉', 'good', 'set'], 'trip.edit': ['✏️', '', 'set'], 'trip.base': ['🪙', 'accent', 'set'], 'trip.lock': ['🔒', '', 'set'], 'trip.unlock': ['🔓', 'warn', 'set'],
+  'trip.admin': ['👑', 'warn', 'set'], 'trip.rekey': ['🔗', 'warn', 'set'], 'trip.delete': ['🗑️', 'danger', 'set'], 'trip.restore': ['♻️', 'good', 'set'],
+};
+const isAdminAct = (i) => /（管理员）$/.test(i.actor) || i.actor === '管理员' || i.action === 'trip.admin' || /^重置了/.test(i.detail);
+function logItemHtml(i) {
+  const [icon, tone] = LOG_KIND[i.action] || ['•', ''];
+  const adm = /（管理员）$/.test(i.actor), who = i.actor.replace(/（管理员）$/, '');
+  // 「修改了一笔：旧 → 新」拆成两行，新的那行把变了的词标出来
+  // 内容本身以名字开头（如「张三 设置了密码」）时去掉，避免名字出现两次
+  const det = i.detail.startsWith(who + ' ') ? i.detail.slice(who.length + 1) : i.detail;
+  const k = det.indexOf('：');
+  let verb = k > 0 ? det.slice(0, k) : det, rest = k > 0 ? det.slice(k + 1) : '';
+  let body = rest ? `<div class="lg-d">${esc(rest.replace(/（\d+ 天内可在「最近删除」恢复）$/, ''))}</div>` : '';
+  if (i.action === 'expense.edit' && rest.includes(' → ')) {
+    const [a, b] = rest.split(' → ');
+    if (a === b) body = `<div class="lg-d">${esc(b)}<div class="lg-same">金额、人员没变（改了备注、分摊细节或图片）</div></div>`;
+    else {
+      const tok = (x) => x.split(/(\s+|，|（|）)/);
+      const old = new Set(tok(a));
+      body = `<div class="lg-diff"><div class="lg-old">${esc(a)}</div><div class="lg-new">${tok(b).map((w) => old.has(w) || !w.trim() ? esc(w) : `<mark>${esc(w)}</mark>`).join('')}</div></div>`;
+    }
+  }
+  return `<div class="lg-item" data-cat="${LOG_KIND[i.action]?.[2] || 'set'}"${isAdminAct(i) ? ' data-adm="1"' : ''}>
+    <span class="lg-ic ${tone}">${icon}</span>
+    <div class="lg-main"><div class="lg-t"><b>${esc(who)}</b>${adm ? '<span class="tag admin">管理员身份</span>' : ''} <span class="lg-v">${esc(verb)}</span></div>${body}</div>
+    <span class="lg-time">${new Date(i.at).toTimeString().slice(0, 5)}</span></div>`;
+}
 async function logSheet() {
-  openSheet(`${sheetHead('操作记录')}<div class="card" id="log-body"><p class="muted">加载中…</p></div>`, async (el) => {
+  let items = [], more = false, cat = 'all';
+  const draw = (el) => {
+    const list = items.filter((i) => cat === 'all' || (cat === 'adm' ? isAdminAct(i) : (LOG_KIND[i.action]?.[2] || 'set') === cat));
+    let html = '', day = '';
+    for (const i of list) {
+      const d = new Date(i.at), ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      if (ds !== day) { if (day) html += '</div>'; day = ds; html += `<div class="lg-day">${md(ds)} ${wk(ds)}</div><div class="card lg-card">`; }
+      html += logItemHtml(i);
+    }
+    if (day) html += '</div>';
+    el.querySelector('#log-body').innerHTML = (html || `<div class="empty small">${items.length ? '这一类还没有记录' : '还没有记录'}</div>`)
+      + (more ? '<button class="btn ghost block" id="log-more">加载更早的记录</button>' : '');
+    const mb = el.querySelector('#log-more');
+    if (mb) mb.onclick = () => load(el, items[items.length - 1].id);
+  };
+  const load = async (el, before) => {
     try {
-      const { items } = await api('GET', `/api/t/${S.key}/log`);
-      el.querySelector('#log-body').innerHTML = items.length ? items.map((i) => `<div class="log-item"><b>${esc(i.actor)}</b> ${esc(i.detail)}<div class="when">${fmtTime(i.at)}</div></div>`).join('') : '<p class="muted">还没有记录</p>';
+      const r = await api('GET', `/api/t/${S.key}/log${before ? `?before=${before}` : ''}`);
+      items = items.concat(r.items); more = r.more; draw(el);
     } catch (e) { el.querySelector('#log-body').innerHTML = `<p class="neg">${esc(e.message)}</p>`; }
+  };
+  const chips = [['all', '全部'], ['bill', '账目'], ['pay', '转账'], ['set', '成员和设置'], ['adm', '👑 管理员操作']];
+  openSheet(`${sheetHead('操作记录')}
+    <p class="muted small" style="margin-top:-6px">所有人都能看到。谁记的、谁改的、用管理员身份改了什么，都在这里。</p>
+    <div class="filter-row" id="log-f">${chips.map(([k, n]) => `<button class="chip small-chip ${k === cat ? 'on' : ''}" data-lf="${k}">${n}</button>`).join('')}</div>
+    <div id="log-body"><p class="muted">加载中…</p></div>`, (el) => {
+    el.querySelector('#log-f').onclick = (e) => {
+      const b = e.target.closest('[data-lf]'); if (!b) return;
+      cat = b.dataset.lf; el.querySelectorAll('[data-lf]').forEach((x) => x.classList.toggle('on', x === b)); draw(el);
+    };
+    load(el);
   });
 }
 

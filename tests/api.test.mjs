@@ -168,11 +168,33 @@ r = await call('DELETE', `/api/t/${key}/members/${B}/pin`); ok('别人不能取�
 r = await call('GET', `/api/t/${key}`); ok('重置后没有密码', !r.data.members.find((m) => m.id === B).hasPin);
 r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B }); ok('重置后不用凭证', r.status === 200);
 
+// 这次游玩的管理员
+const E1body = { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费', shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) };
+r = await call('PUT', `/api/t/${key}/admin`, { memberId: C }, { actor: C }); ok('普通成员不能指定管理员', r.status === 403);
+{ const c = cookie; cookie = adminCookie;
+  r = await call('PUT', `/api/t/${key}/admin`, { memberId: C }, { actor: 0 }); ok('网站管理员指定管理员', r.status === 200);
+  cookie = c; }
+r = await call('GET', `/api/t/${key}`); ok('adminId', r.data.trip.adminId === C);
+r = await call('PUT', `/api/t/${key}/expenses/${E1}`, E1body, { actor: C }); ok('管理员没设密码时权限不生效', r.status === 403);
+r = await call('PUT', `/api/t/${key}/admin`, { memberId: B }, { actor: C }); ok('没设密码不能转让', r.status === 403 && /密码/.test(r.data.error));
+r = await call('PUT', `/api/t/${key}/members/${C}/pin`, { pin: '9090' }, { actor: C }); const TC = r.data.token;
+r = await call('PUT', `/api/t/${key}/expenses/${E1}`, E1body, { actor: C, token: TC }); ok('管理员能改别人的账', r.status === 200, JSON.stringify(r.data));
+r = await call('PUT', `/api/t/${key}/members/${A}/pin`, { pin: '1212' }, { actor: A }); const TA = r.data.token;
+r = await call('DELETE', `/api/t/${key}/members/${A}/pin`, undefined, { actor: C, token: TC }); ok('管理员能重置别人的密码', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: A, token: TA }); ok('重置后 A 不用凭证', r.status === 200);
+r = await call('GET', `/api/t/${key}/log`);
+ok('操作记录标出管理员身份', r.data.items.some((i) => i.actor === 'zz丙（管理员）' && i.action === 'expense.edit'), JSON.stringify(r.data.items.slice(0, 4)));
+ok('操作记录有分页字段', Array.isArray(r.data.items) && typeof r.data.more === 'boolean');
+r = await call('PUT', `/api/t/${key}/admin`, { memberId: B }, { actor: C, token: TC }); ok('管理员转让', r.status === 200);
+r = await call('PUT', `/api/t/${key}/expenses/${E1}`, E1body, { actor: C, token: TC }); ok('转让后原管理员没权限了', r.status === 403);
+r = await call('GET', `/api/t/${key}/log`); ok('转让写进记录', r.data.items.some((i) => i.action === 'trip.admin' && /交给了 zz乙/.test(i.detail)));
+r = await call('DELETE', `/api/t/${key}/members/${C}/pin`, undefined, { actor: C, token: TC });
+
 // 锁定
 r = await call('POST', `/api/t/${key}/lock`, {}); ok('锁定', r.status === 200);
 r = await call('POST', `/api/t/${key}/expenses`, { amount: '1', payerId: A, shares: [{ memberId: A }] }); ok('锁定后不能记账', r.status === 423);
 r = await call('DELETE', `/api/t/${key}/expenses/${E1}`); ok('锁定后不能删', r.status === 423);
-r = await call('POST', `/api/t/${key}/unlock`, {}); ok('非管理员不能解锁', r.status === 401);
+r = await call('POST', `/api/t/${key}/unlock`, {}); ok('非管理员不能解锁', r.status === 403);
 cookie = adminCookie;
 r = await call('GET', `/api/admin/trips`); const lt = r.data.trips.find((t) => t.id === tripId);
 ok('列表：已锁定、已结清', lt && lt.locked && lt.unsettled === 0 && lt.total === 81000, JSON.stringify(lt));
@@ -270,6 +292,7 @@ cookie = '';
 r = await call('POST', '/api/invite/trips', { code: inv.code.toLowerCase().replace(/(.{5})/, '$1-'), name: 'zz邀请建的', startDay: '2026-12-02', creator: 'zz阿杰', members: ['zz乙'], baseCurrency: 'HKD' });
 ok('凭邀请码建游玩', r.status === 200 && r.data.key && r.data.meId, JSON.stringify(r.data)); const ikey = r.data.key;
 r = await call('GET', `/api/t/${ikey}`); ok('创建人自动加入、港币结算', r.data.members.some((m) => m.name === 'zz阿杰') && r.data.trip.base === 'HKD');
+ok('邀请码创建人是管理员', r.data.trip.adminId === r.data.members.find((m) => m.name === 'zz阿杰')?.id);
 r = await call('GET', '/api/admin/invites'); ok('普通人不能看邀请码', r.status === 401);
 cookie = adminCookie;
 r = await call('GET', '/api/admin/invites'); ok('使用次数', r.data.invites.find((i) => i.id === inv.id)?.uses === 1);

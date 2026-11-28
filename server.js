@@ -283,7 +283,7 @@ async function tripPayload(trip, admin) {
   const codeMap = {};
   for (const c of codes) (codeMap[c.person_id] ||= {})[c.kind] = new Date(c.updated_at).getTime();
   return {
-    trip: { id: trip.id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at,
+    trip: { id: trip.id, adminId: trip.admin_member_id, name: trip.name, startDay: trip.start_s, endDay: trip.end_s, note: trip.note, locked: trip.locked, lockedAt: trip.locked_at,
       base, toCny: toCnyFactor(base, rates, live) },
     members: members.map((m) => ({ id: m.id, name: m.name, weight: m.weight, codes: codeMap[m.person_id] || {}, hasPin: !!m.pin_hash })),
     expenses, payments, balances, transfers,
@@ -310,16 +310,22 @@ async function identify(req, key) {
     const ok = tok && (await db.query(`SELECT 1 FROM member_tokens WHERE token_hash=$1 AND member_id=$2`, [sha256(tok), m.id])).rowCount;
     if (!ok) return { id: m.id, name: m.name, needPin: true };
   }
-  return { id: m.id, name: m.name };
+  return { id: m.id, name: m.name, pinned: !!m.pin_hash };
 }
+// 用管理员权限改了别人的东西，操作记录里写成「张三（管理员）」，大家都看得到
 async function actorName(q, trip, req, admin) {
-  return req.actor?.name || (admin ? '管理员' : '未署名');
+  if (!req.actor) return admin ? '管理员' : '未署名';
+  return req.actor.name + (req.asAdmin ? '（管理员）' : '');
 }
-// 只有记账人（创建人）和管理员能改 / 删
+// 这次游玩的管理员：是 trips.admin_member_id，并且设了密码、这台手机输过密码（identify 已核对凭证）
+const isTripAdmin = (req, trip) => !!(req.actor?.pinned && trip.admin_member_id && req.actor.id === trip.admin_member_id);
+const canManage = (req, admin, trip) => !!admin || isTripAdmin(req, trip);
+// 只有记账人（创建人）和管理员（网站管理员 / 这次游玩的管理员）能改 / 删
 function assertOwner(req, admin, owner, what) {
-  if (admin) return;
+  if (owner && owner !== '未署名' && owner !== '管理员' && req.actor?.name === owner) return;
+  if (admin || req.tripAdmin) { req.asAdmin = true; return; }
   if (!owner || owner === '未署名' || owner === '管理员') throw new HttpError(403, `这${what}只有管理员能改`);
-  if (req.actor?.name !== owner) throw new HttpError(403, `这${what}是「${owner}」记的，只有 TA 和管理员能改`);
+  throw new HttpError(403, `这${what}是「${owner}」记的，只有 TA 和管理员能改`);
 }
 async function issueToken(q, memberId) {
   const tok = crypto.randomBytes(24).toString('base64url');
@@ -418,7 +424,7 @@ route('PUT', '/api/t/:key/members/:id/pin', async ({ params, body, req, admin })
 // 取消密码：本人，或者管理员（忘了密码时重置）
 route('DELETE', '/api/t/:key/members/:id/pin', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
-  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, '只有本人和管理员能取消密码');
+  if (!canManage(req, admin, trip) && req.actor?.id !== params.id) throw new HttpError(403, '只有本人和管理员能取消密码');
   await tripTx(trip, async (q) => {
     const m = (await memberMap(q, trip.id)).get(params.id);
     if (!m) throw new HttpError(404, '成员不存在');
@@ -469,7 +475,7 @@ route('PUT', '/api/t/:key/paycode/:id/:kind', async ({ params, rawBody, req, adm
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
-  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员上传`);
+  if (!canManage(req, admin, trip) && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员上传`);
   const img = saveImage(rawBody);
   const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`SELECT file FROM pay_codes WHERE person_id=$1 AND kind=$2`, [m.person_id, params.kind]);
@@ -485,7 +491,7 @@ route('DELETE', '/api/t/:key/paycode/:id/:kind', async ({ params, req, admin }) 
   const trip = await loadTrip(params.key);
   assertOpen(trip);
   const m = await codeMember(trip, params.id);
-  if (!admin && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员删除`);
+  if (!canManage(req, admin, trip) && req.actor?.id !== params.id) throw new HttpError(403, `收款码只能 ${m.name} 本人或管理员删除`);
   const old = await tripTx(trip, async (q) => {
     const { rows: [o] } = await q.query(`DELETE FROM pay_codes WHERE person_id=$1 AND kind=$2 RETURNING file`, [m.person_id, params.kind]);
     if (o) await log(q, trip.id, await actorName(q, trip, req, admin), 'paycode.remove', `删除了 ${m.name} 的${KIND_CN[params.kind]}收款码`);
@@ -614,9 +620,9 @@ route('PUT', '/api/t/:key/expenses/:id', async ({ params, body, req, admin }) =>
   assertOpen(trip);
   return tripTx(trip, async (q) => {
     const mm = await memberMap(q, trip.id);
-    const actor = await actorName(q, trip, req, admin);
     const old = await loadExpense(q, trip, params.id);
     assertOwner(req, admin, old.created_by, '笔账');
+    const actor = await actorName(q, trip, req, admin);
     const rate = await tripRate(q, trip, body.currency, body.rate, actor);
     const e = parseExpense(body, mm, todayStr(), rate, trip.base_currency);
     await q.query(`UPDATE expenses SET payer_id=$1,cents=$2,category=$3,title=$4,note=$5,day=$6,currency=$7,orig_cents=$8,rate=$9,cny_override=$10,updated_at=now() WHERE id=$11`,
@@ -777,7 +783,7 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
     if (await tripImageBytes(q, trip.id) + img.bytes > TRIP_IMAGE_QUOTA)
       throw bad(`这次游玩的截图已满 ${TRIP_IMAGE_QUOTA / MB}MB（含最近删除），删掉一些再传`);
     const actor = await actorName(q, trip, req, admin);
-    const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id`, [e.id, img.file, img.mime, img.bytes, actor]);
+    const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id`, [e.id, img.file, img.mime, img.bytes, req.actor?.name || actor]);
     await log(q, trip.id, actor, 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtMoney(trip.base_currency, e.cents)}」加了一张图`);
     return { id: r.id };
   }).catch((err) => { removeFiles([img.file]); throw err; });
@@ -792,8 +798,9 @@ route('PATCH', '/api/t/:key/images/:id', async ({ params, body, req, admin }) =>
     const { rows: [i] } = await q.query(`SELECT i.id, i.note, i.created_by, e.created_by AS exp_by, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
     if (!i) throw new HttpError(404, '图片不存在');
     // 只有传图的人（旧图没记传图人，就按这笔账的记账人）和管理员能改备注
-    const actor = await actorName(q, trip, req, admin), owner = i.created_by || i.exp_by;
+    const owner = i.created_by || i.exp_by;
     assertOwner(req, admin, owner, '张图的备注');
+    const actor = await actorName(q, trip, req, admin);
     if (i.note === note) return { ok: true };
     await q.query(`UPDATE images SET note=$1 WHERE id=$2`, [note, i.id]);
     await log(q, trip.id, actor, 'image.note',
@@ -837,12 +844,17 @@ route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) =>
   return tripTx(trip, async (q) => {
     const { rows: [t] } = await q.query(`DELETE FROM trash WHERE id=$1 AND trip_id=$2 RETURNING *`, [params.id, trip.id]);
     if (!t) throw new HttpError(404, '这条删除记录不存在（可能已经恢复过了）');
-    const actor = await actorName(q, trip, req, admin);
+    if (t.kind === 'expense') assertOwner(req, admin, t.data.expense.created_by, '笔账');
     if (t.kind === 'image') {
       const i = t.data.image;
       const { rows: [e] } = await q.query(`SELECT id, created_by FROM expenses WHERE id=$1 AND trip_id=$2`, [i.expense_id, trip.id]);
       if (!e) throw bad('这张图所属的账目已经删除了，先恢复那笔账');
       if (!(req.actor && req.actor.name === i.created_by)) assertOwner(req, admin, e.created_by, '笔账的图');
+    }
+    const actor = await actorName(q, trip, req, admin);
+    if (t.kind === 'image') {
+      const i = t.data.image;
+      const { rows: [e] } = await q.query(`SELECT id FROM expenses WHERE id=$1`, [i.expense_id]);
       const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
       if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`这笔账已经有 ${MAX_IMAGES_PER_EXPENSE} 张图了`);
       await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [i.id, e.id, i.file, i.mime, i.bytes, i.note || '', i.created_by || '', i.created_at]);
@@ -911,17 +923,34 @@ route('POST', '/api/t/:key/lock', async ({ params, req, admin }) => {
 });
 route('POST', '/api/t/:key/unlock', async ({ params, req, admin }) => {
   const trip = await loadTrip(params.key);
+  if (!canManage(req, admin, trip)) throw new HttpError(403, '只有管理员能解锁');
   await tripTx(trip, async (q) => {
     await q.query(`UPDATE trips SET locked=false, locked_at=NULL WHERE id=$1`, [trip.id]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.unlock', '解锁了账单');
   }, { open: false });
   return { ok: true };
-}, { auth: 'admin' });
+});
 
-route('GET', '/api/t/:key/log', async ({ params }) => {
+// ---------- 这次游玩的管理员 ----------
+// 网站管理员可以指定；现任管理员（设了密码）可以转让给别人
+route('PUT', '/api/t/:key/admin', async ({ params, body, req, admin }) => {
   const trip = await loadTrip(params.key);
-  const { rows } = await db.query(`SELECT id, at, actor, action, detail FROM audit WHERE trip_id=$1 ORDER BY id DESC LIMIT 500`, [trip.id]);
-  return { items: rows };
+  if (!canManage(req, admin, trip)) throw new HttpError(403, trip.admin_member_id && req.actor?.id === trip.admin_member_id ? '先给自己设个密码，管理员权限才生效' : '只有管理员能转让');
+  await tripTx(trip, async (q) => {
+    const m = (await memberMap(q, trip.id)).get(Number(body.memberId));
+    if (!m) throw new HttpError(404, '成员不存在');
+    await q.query(`UPDATE trips SET admin_member_id=$1 WHERE id=$2`, [m.id, trip.id]);
+    await log(q, trip.id, await actorName(q, trip, req, admin), 'trip.admin', `把这次游玩的管理员交给了 ${m.name}`);
+  }, { open: false });
+  return { ok: true };
+});
+
+// 操作记录：所有拿到链接的人都能看（保证公平）。每次 200 条，?before=<id> 往前翻
+route('GET', '/api/t/:key/log', async ({ params, query }) => {
+  const trip = await loadTrip(params.key);
+  const before = Number(query.get('before')) || 2147483647;
+  const { rows } = await db.query(`SELECT id, at, actor, action, detail FROM audit WHERE trip_id=$1 AND id < $2 ORDER BY id DESC LIMIT 201`, [trip.id, before]);
+  return { items: rows.slice(0, 200), more: rows.length > 200 };
 });
 
 // ---------- 管理员 ----------
@@ -1007,6 +1036,8 @@ route('POST', '/api/invite/trips', async ({ body, req }) => {
     const r = await createTrip(q, t, creator || `邀请码（${inv.note || code}）`, inv.id);
     await q.query(`UPDATE invites SET uses=uses+1 WHERE id=$1`, [inv.id]);
     if (creator) r.meId = (await q.query(`SELECT m.id FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 AND p.name=$2`, [r.id, creator])).rows[0]?.id;
+    // 凭邀请码建游玩的人就是这次的管理员
+    if (r.meId) await q.query(`UPDATE trips SET admin_member_id=$1 WHERE id=$2`, [r.meId, r.id]);
     return r;
   });
 });
@@ -1290,6 +1321,7 @@ const server = http.createServer(async (req, res) => {
         req.actor = null;
       }
       if (!req.actor && !admin && !r.open) throw new HttpError(403, '先在右上角选「我是谁」再操作', 'who_required');
+      if (req.actor?.pinned) req.tripAdmin = isTripAdmin(req, await loadTrip(params.key));
     }
     const result = await r.handler({ req, res, admin, params, body, rawBody, query: url.searchParams });
     if (result && result.__file) {

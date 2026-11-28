@@ -226,3 +226,6 @@ CREATE TABLE IF NOT EXISTS member_tokens (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS member_tokens_member ON member_tokens(member_id);
+
+-- 这次游玩的管理员（成员）：凭邀请码建游玩时是创建人；可以转让。必须设了密码，管理员权限才生效
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS admin_member_id int REFERENCES members(id) ON DELETE SET NULL;
