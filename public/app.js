@@ -839,8 +839,8 @@ function renderBills(body) {
     // 账多时屏幕外的列表先不绘制（content-visibility），按每行约 71px 估高度，滚动条和返回时的位置才准
     const lst = list.length > 10 ? `<div class="list cv" style="contain-intrinsic-size:auto ${list.length * 71}px">` : '<div class="list">';
     html += fold
-      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button>${lst}`
-      : `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div>${lst}`;
+      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="cnt">· ${list.length} 笔</span> <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button>${lst}`
+      : `<div class="day-head"><span>${md(day)} ${wk(day)}${list.length > 1 ? ` <span class="cnt">· ${list.length} 笔</span>` : ''}</span><span class="num">${money(sum)}</span></div>${lst}`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
       const sub = `${e.currency !== BASE ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
@@ -855,6 +855,9 @@ function renderBills(body) {
   body.querySelectorAll('[data-f]').forEach((b) => b.onclick = () => { S.billFilter = b.dataset.f; renderBills(body); });
   body.querySelectorAll('[data-day]').forEach((b) => b.onclick = () => {
     const k = b.dataset.day; S.openDays.has(k) ? S.openDays.delete(k) : S.openDays.add(k); renderBills(body);
+    // 在顶部吸着的标题上点了收起：收起后那一天可能已经滚到屏幕上面去了，滚回来
+    const el = body.querySelector(`[data-day="${k}"]`);
+    if (el && el.getBoundingClientRect().top < 0) el.scrollIntoView({ block: 'start' });
   });
   body.querySelectorAll('[data-foldall]').forEach((b) => b.onclick = () => {
     S.openDays = new Set(b.dataset.foldall === '1' ? groups.keys() : []); renderBills(body);
