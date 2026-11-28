@@ -101,7 +101,16 @@ function toast(msg, err = false) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => { t.className = err ? 'err' : ''; }, err ? 3200 : 1800);
 }
 
-async function api(method, url, body, { raw = false } = {}) {
+// 请求超过 150ms 还没回来，顶部显示一条细的加载条（任何操作都有反馈）
+let apiPending = 0, loadTimer = null;
+const $loadbar = document.getElementById('loadbar');
+function loadStart() { if (apiPending++ === 0) loadTimer = setTimeout(() => $loadbar.classList.add('on'), 150); }
+function loadEnd() { if (--apiPending === 0) { clearTimeout(loadTimer); $loadbar.classList.remove('on'); } }
+async function api(method, url, body, opts) {
+  loadStart();
+  try { return await api0(method, url, body, opts); } finally { loadEnd(); }
+}
+async function api0(method, url, body, { raw = false } = {}) {
   const headers = {};
   if (S.trip && S.me) { headers['X-Actor'] = String(S.me); const tk = myToken(); if (tk) headers['X-Actor-Token'] = tk; }
   let payload;
@@ -415,6 +424,8 @@ document.addEventListener('click', (e) => {
 
 async function route() {
   const m = location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,32})\/?$/);
+  // 换到另一次游玩：先画骨架屏，不让上一页停在那里看起来像卡住
+  if (m && S.key !== m[1]) $app.innerHTML = skeletonTrip();
   try {
     const meRes = await api('GET', '/api/me');
     S.admin = meRes.admin; S.today = meRes.today;
@@ -431,6 +442,13 @@ async function route() {
   S.trip = null; S.key = null;
   if (!S.admin) return renderLogin();
   return renderAdmin();
+}
+
+// 加载中的骨架屏：页面轮廓 + 微光动画，数据到了再换成真内容
+const skelRows = (n) => Array.from({ length: n }, () => '<div class="sk-row"><span class="sk sk-ic"></span><span class="sk-m"><span class="sk sk-l1"></span><span class="sk sk-l2"></span></span><span class="sk sk-amt"></span></div>').join('');
+function skeletonTrip() {
+  return `<div class="wrap" aria-busy="true" aria-label="加载中"><div class="top"><span class="sk sk-btn"></span><span class="sk sk-title"></span></div>
+    <div class="sk sk-hero"></div><div class="sk sk-day"></div><div class="list">${skelRows(6)}</div></div>`;
 }
 
 // ---------- 登录 ----------
@@ -1915,7 +1933,9 @@ function logItemHtml(i) {
     <div class="lg-main"><div class="lg-t"><b>${esc(who)}</b>${adm ? '<span class="tag admin">👑 管理员身份</span>' : ''}<span class="lg-v">${esc(verb)}</span></div><span class="lg-time">${logTime(i.at)}</span>${body}</div></div>`;
 }
 async function logSheet() {
-  let items = [], more = false, cat = 'all';
+  // 一次只取 40 条（画太多条手机会卡），滑到底自动取下一批
+  const PAGE = 40;
+  let items = [], more = false, cat = 'all', loading = false, io = null;
   const draw = (el) => {
     const list = items.filter((i) => cat === 'all' || (cat === 'adm' ? isAdminAct(i) : (LOG_KIND[i.action]?.[2] || 'set') === cat));
     let html = '', day = '';
@@ -1924,29 +1944,35 @@ async function logSheet() {
       if (ds !== day) {
         if (day) html += '</div>';
         day = ds;
-        const n = list.filter((x) => new Date(x.at).toDateString() === d.toDateString()).length;
         const rel = d.toDateString() === new Date().toDateString() ? '今天 · ' : d.toDateString() === new Date(Date.now() - 864e5).toDateString() ? '昨天 · ' : '';
-        html += `<div class="lg-day"><span>${rel}${md(ds)} ${wk(ds)}</span><span>${n} 条</span></div><div class="card lg-card">`;
+        html += `<div class="lg-day"><span>${rel}${md(ds)} ${wk(ds)}</span></div><div class="card lg-card">`;
       }
       html += logItemHtml(i);
     }
     if (day) html += '</div>';
-    el.querySelector('#log-body').innerHTML = (html || `<div class="empty small">${items.length ? '这一类还没有记录' : '还没有记录'}</div>`)
-      + (more ? '<button class="btn ghost block" id="log-more">加载更早的记录</button>' : '');
+    el.querySelector('#log-body').innerHTML = (html || (more ? '' : `<div class="empty small">${items.length ? '这一类还没有记录' : '还没有记录'}</div>`))
+      + (more ? `<div id="log-more" class="lg-more">${skelLog(2)}</div>` : items.length > PAGE ? '<p class="faint small" style="text-align:center;margin:14px 0">已经是最早的记录了</p>' : '');
+    // 「加载更多」那块露出来就自动加载；筛选后这一类太少时也会继续往前翻
+    io?.disconnect();
     const mb = el.querySelector('#log-more');
-    if (mb) mb.onclick = () => load(el, items[items.length - 1].id);
+    if (mb) { io = new IntersectionObserver((es) => { if (es.some((x) => x.isIntersecting)) load(el); }, { root: $sheet, rootMargin: '300px' }); io.observe(mb); }
   };
-  const load = async (el, before) => {
+  const load = async (el) => {
+    if (loading) return; loading = true;
     try {
-      const r = await api('GET', `/api/t/${S.key}/log${before ? `?before=${before}` : ''}`);
-      items = items.concat(r.items); more = r.more; draw(el);
+      const before = items.length ? `&before=${items[items.length - 1].id}` : '';
+      const r = await api('GET', `/api/t/${S.key}/log?limit=${PAGE}${before}`);
+      items = items.concat(r.items); more = r.more;
+      if ($sheet.contains(el.querySelector('#log-body'))) draw(el);
     } catch (e) { el.querySelector('#log-body').innerHTML = `<p class="neg">${esc(e.message)}</p>`; }
+    finally { loading = false; }
   };
   const chips = [['all', '全部'], ['bill', '账目'], ['pay', '转账'], ['set', '成员和设置'], ['adm', '👑 管理员操作']];
   openSheet(`${sheetHead('操作记录')}
     <p class="muted small" style="margin-top:-6px">所有人都能看到。谁记的、谁改的、用管理员身份改了什么，都在这里。</p>
     <div class="filter-row" id="log-f">${chips.map(([k, n]) => `<button class="chip small-chip ${k === cat ? 'on' : ''}" data-lf="${k}">${n}</button>`).join('')}</div>
-    <div id="log-body"><p class="muted">加载中…</p></div>`, (el) => {
+    <div id="log-body"><div class="sk sk-day" style="width:120px"></div><div class="card lg-card">${skelLog(5)}</div></div>`, (el) => {
+    $sheet._onClose = () => io?.disconnect();
     el.querySelector('#log-f').onclick = (e) => {
       const b = e.target.closest('[data-lf]'); if (!b) return;
       cat = b.dataset.lf; el.querySelectorAll('[data-lf]').forEach((x) => x.classList.toggle('on', x === b)); draw(el);
@@ -1954,5 +1980,6 @@ async function logSheet() {
     load(el);
   });
 }
+const skelLog = (n) => Array.from({ length: n }, () => '<div class="lg-item"><span class="sk lg-ic"></span><div class="lg-main"><span class="sk sk-l1"></span><span class="sk sk-card"></span></div></div>').join('');
 
 route();

@@ -945,12 +945,13 @@ route('PUT', '/api/t/:key/admin', async ({ params, body, req, admin }) => {
   return { ok: true };
 });
 
-// 操作记录：所有拿到链接的人都能看（保证公平）。每次 200 条，?before=<id> 往前翻
+// 操作记录：所有拿到链接的人都能看（保证公平）。?limit=条数（默认 200，最多 200），?before=<id> 往前翻
 route('GET', '/api/t/:key/log', async ({ params, query }) => {
   const trip = await loadTrip(params.key);
   const before = Number(query.get('before')) || 2147483647;
-  const { rows } = await db.query(`SELECT id, at, actor, action, detail FROM audit WHERE trip_id=$1 AND id < $2 ORDER BY id DESC LIMIT 201`, [trip.id, before]);
-  return { items: rows.slice(0, 200), more: rows.length > 200 };
+  const limit = Math.min(200, Math.max(1, Number(query.get('limit')) || 200));
+  const { rows } = await db.query(`SELECT id, at, actor, action, detail FROM audit WHERE trip_id=$1 AND id < $2 ORDER BY id DESC LIMIT $3`, [trip.id, before, limit + 1]);
+  return { items: rows.slice(0, limit), more: rows.length > limit };
 });
 
 // ---------- 管理员 ----------
