@@ -825,8 +825,9 @@ function renderBills(body) {
     if (!S.openDays) S.openDays = new Set([[...groups.keys()][0]]);
     if (S.flashExp) { const fe = d.expenses.find((e) => e.id === S.flashExp); if (fe) S.openDays.add(fe.day); }
     const allOpen = [...groups.keys()].every((k) => S.openDays.has(k));
-    html += `<div class="fold-all"><button class="link-btn" data-foldall="${allOpen ? 0 : 1}">${allOpen ? '全部收起' : '全部展开'}</button></div>`;
+    html += `<div class="fold-all"><button class="link-btn" data-jump>📅 跳到某天</button><button class="link-btn" data-foldall="${allOpen ? 0 : 1}">${allOpen ? '全部收起' : '全部展开'}</button></div>`;
   }
+  const jump = groups.size > 1;
   for (const [day, list] of groups) {
     const sum = list.reduce((a, e) => a + e.cents, 0);
     if (fold && !S.openDays.has(day)) {
@@ -838,9 +839,10 @@ function renderBills(body) {
     }
     // 账多时屏幕外的列表先不绘制（content-visibility），按每行约 71px 估高度，滚动条和返回时的位置才准
     const lst = list.length > 10 ? `<div class="list cv" style="contain-intrinsic-size:auto ${list.length * 71}px">` : '<div class="list">';
-    html += fold
-      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="cnt">· ${list.length} 笔</span> <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button>${lst}`
-      : `<div class="day-head"><span>${md(day)} ${wk(day)}${list.length > 1 ? ` <span class="cnt">· ${list.length} 笔</span>` : ''}</span><span class="num">${money(sum)}</span></div>${lst}`;
+    // 日期标题（滚动时吸顶）：点日期 = 跳到某天，点右边的「收起」= 收起这天
+    const label = `${md(day)} ${wk(day)}${list.length > 1 ? ` <span class="cnt">· ${list.length} 笔</span>` : ''}`;
+    html += `<div class="day-head" data-dh="${day}">${jump ? `<button class="dh-date" data-jump>${label} <span class="chev" aria-hidden="true">▾</span></button>` : `<span>${label}</span>`}
+      <span class="num">${money(sum)}</span>${fold ? `<button class="dh-fold" data-day="${day}">收起</button>` : ''}</div>${lst}`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
       const sub = `${e.currency !== BASE ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
@@ -859,10 +861,34 @@ function renderBills(body) {
     const el = body.querySelector(`[data-day="${k}"]`);
     if (el && el.getBoundingClientRect().top < 0) el.scrollIntoView({ block: 'start' });
   });
+  body.querySelectorAll('[data-jump]').forEach((b) => b.onclick = () => jumpDaySheet(body, groups, fold));
   body.querySelectorAll('[data-foldall]').forEach((b) => b.onclick = () => {
     S.openDays = new Set(b.dataset.foldall === '1' ? groups.keys() : []); renderBills(body);
   });
   if (S.flashExp) { const id = S.flashExp; S.flashExp = null; requestAnimationFrame(() => flash(`[data-exp="${id}"]`)); }
+}
+
+// 跳到某天：列出（当前筛选下的）每一天，点了就展开那天并滚过去
+function jumpDaySheet(body, groups, fold) {
+  const heads = [...body.querySelectorAll('.day-head[data-dh]')];
+  const cur = heads.filter((h) => h.getBoundingClientRect().top <= 1).pop()?.dataset.dh;
+  openSheet(`${sheetHead('跳到哪天')}<div class="list">${[...groups].map(([day, list]) => `<button class="item${day === cur ? ' on' : ''}" data-to="${day}">
+      <span class="main"><span class="t">${md(day)} ${wk(day)}${day === cur ? ' <span class="tag">正在看</span>' : ''}</span><span class="s">${list.length} 笔${fold && !S.openDays.has(day) ? ' · 已收起' : ''}</span></span>
+      <span class="amt"><b class="num">${money(list.reduce((a, e) => a + e.cents, 0))}</b></span></button>`).join('')}</div>`, (el) => {
+    el.querySelector('.on')?.scrollIntoView({ block: 'center' });
+    el.querySelectorAll('[data-to]').forEach((b) => b.onclick = () => {
+      const day = b.dataset.to;
+      closeSheet();
+      if (fold && !S.openDays.has(day)) { S.openDays.add(day); renderBills(body); }
+      // 标题是吸顶的，不能直接 scrollIntoView；按它后面那块列表的位置算。屏幕外的列表高度是估的，下一帧再校正一次
+      const to = () => {
+        const h = body.querySelector(`.day-head[data-dh="${day}"]`);
+        const next = h?.nextElementSibling;
+        if (next) scrollTo(0, next.getBoundingClientRect().top + scrollY - h.offsetHeight);
+      };
+      to(); requestAnimationFrame(() => requestAnimationFrame(to));
+    });
+  });
 }
 
 // 除不尽时说明精确金额：单笔里零头先记给一个人（这样这笔加起来正好等于总额），结算时按精确值合计、最后四舍五入

@@ -119,8 +119,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin: 6px -16px 0; padding: max(8px, env(safe-area-inset-top)) 20px 6px; background: color-mix(in srgb, var(--bg) 90%, transparent);
   -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
 .day-head .cnt { color: var(--faint); }
-.day-head.open { width: calc(100% + 32px); box-sizing: border-box; border: 0; font: inherit; font-size: 13px; color: var(--muted); cursor: pointer; text-align: left; }
-.day-head .chev { display: inline-block; transform: rotate(90deg); margin-left: 2px; }
+.day-head .dh-date { flex: 1; min-width: 0; text-align: left; border: 0; background: none; padding: 4px 0; margin: -4px 0; font: inherit; color: inherit; cursor: pointer; }
+.day-head .dh-date .chev { font-size: 11px; }
+.day-head .dh-fold { flex: none; margin: -6px -8px -6px 0; padding: 6px 8px; border: 0; background: none; color: var(--accent); font: inherit; font-size: 13px; cursor: pointer; }
 .day-fold { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 8px; padding: 12px 14px; border: 0; border-radius: var(--r-lg); background: var(--card); box-shadow: var(--shadow); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
 .day-fold:active { background: var(--soft); }
 .day-fold .main { flex: 1; min-width: 0; }
@@ -128,9 +129,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .day-fold .t { font-weight: 500; }
 .day-fold .s { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .day-fold b { font-weight: 600; font-size: 16px; }
-.day-fold .chev, .day-head .chev { color: var(--faint); font-size: 18px; line-height: 1; }
+.day-fold .chev { color: var(--faint); font-size: 18px; line-height: 1; }
 .link-btn { border: 0; background: none; padding: 4px 0; font: inherit; font-size: 13px; color: var(--accent); cursor: pointer; }
-.fold-all { display: flex; justify-content: flex-end; margin: 0 4px -8px; }
+.fold-all { display: flex; justify-content: space-between; margin: 0 4px -8px; }
 .list.cv { content-visibility: auto; }
 .list { background: var(--card); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; }
 .item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; width: 100%; border: 0; background: none; text-align: left; }
@@ -360,6 +361,7 @@ details > summary::-webkit-details-marker { display: none; }
 details > summary::before { content: "▸ "; }
 details[open] > summary::before { content: "▾ "; }
 .tag { white-space: nowrap; }
+#sheet .item.on { background: var(--accent-soft); }
 
 /* 管理员首页的数据安全状态行 */
 .health { display: block; width: 100%; text-align: left; margin: 0 0 12px; padding: 9px 12px; border-radius: 12px;
