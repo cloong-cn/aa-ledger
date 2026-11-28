@@ -170,14 +170,41 @@ function confirmSheet(title, text, okText = '确定', danger = false) {
 }
 
 const $viewer = document.getElementById('viewer');
-function viewImage(src) {
-  $viewer.innerHTML = `<img src="${esc(src)}" alt="图片"><button class="icon-btn close" aria-label="关闭">✕</button>`;
+// 看大图：srcs 是同一组的所有图，可以左右滑动 / 点两边箭头 / 键盘 ← → 切换；点图片或 ✕ 关闭
+function viewImage(srcs, index = 0) {
+  if (!Array.isArray(srcs)) srcs = [srcs];
+  const many = srcs.length > 1;
+  $viewer.innerHTML = `<div class="track">${srcs.map((u) => `<div class="slide"><img src="${esc(u)}" alt="图片" draggable="false"></div>`).join('')}</div>
+    ${many ? `<div class="count"></div><button class="nav prev" data-step="-1" aria-label="上一张">‹</button><button class="nav next" data-step="1" aria-label="下一张">›</button>` : ''}
+    <button class="icon-btn close" aria-label="关闭">✕</button>`;
   $viewer.hidden = false;
+  const track = $viewer.querySelector('.track');
+  track.scrollLeft = index * track.clientWidth;
+  if (many) {
+    const sync = () => {
+      const i = Math.round(track.scrollLeft / track.clientWidth);
+      $viewer.querySelector('.count').textContent = `${i + 1} / ${srcs.length}`;
+      $viewer.querySelector('.prev').hidden = i === 0;
+      $viewer.querySelector('.next').hidden = i === srcs.length - 1;
+    };
+    track.addEventListener('scroll', sync, { passive: true });
+    sync();
+  }
 }
-$viewer.addEventListener('click', () => { $viewer.hidden = true; $viewer.innerHTML = ''; });
+function viewerStep(d) {
+  const track = $viewer.querySelector('.track');
+  if (track) track.scrollBy({ left: d * track.clientWidth, behavior: 'smooth' });
+}
+function closeViewer() { $viewer.hidden = true; $viewer.innerHTML = ''; }
+$viewer.addEventListener('click', (e) => {
+  const nav = e.target.closest('[data-step]');
+  if (nav) return viewerStep(Number(nav.dataset.step));
+  closeViewer();
+});
 document.addEventListener('keydown', (e) => {
+  if (!$viewer.hidden && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return viewerStep(e.key === 'ArrowLeft' ? -1 : 1);
   if (e.key !== 'Escape') return;
-  if (!$viewer.hidden) { $viewer.hidden = true; return; }
+  if (!$viewer.hidden) return closeViewer();
   if (!$sheet.hidden) closeSheet();
 });
 
@@ -672,7 +699,7 @@ function expenseDetail(id) {
     ${e.images.length ? `<div class="section-title"><span>截图</span></div><div class="thumbs">${imgs}</div>` : ''}
     <p class="faint tiny" style="margin:14px 2px">${esc(e.createdBy || '未署名')} 记于 ${fmtTime(e.createdAt)}${e.updatedAt && new Date(e.updatedAt) - new Date(e.createdAt) > 2000 ? ` · 修改于 ${fmtTime(e.updatedAt)}` : ''}</p>
     ${editable() ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>` : ''}`, (el) => {
-    el.querySelectorAll('[data-img]').forEach((b) => b.onclick = () => viewImage(`/api/t/${S.key}/images/${b.dataset.img}`));
+    el.querySelectorAll('[data-img]').forEach((b, i, all) => b.onclick = () => viewImage([...all].map((x) => `/api/t/${S.key}/images/${x.dataset.img}`), i));
     const del = el.querySelector('#ed-del');
     if (del) del.onclick = async () => {
       if (!(await confirmSheet('删除这笔账？', `${esc(e.title || CAT[e.category].name)} ${money(e.cents)}，连同截图一起删除。30 天内可以在「成员 → 最近删除」里恢复。`, '删除', true))) return expenseDetail(id);
@@ -869,7 +896,7 @@ function expenseForm(exp) {
     };
     $('#f-imgs').onclick = async (e) => {
       const v = e.target.closest('[data-view]');
-      if (v) return viewImage(v.dataset.view);
+      if (v) { const all = [...$('#f-imgs').querySelectorAll('[data-view]')]; return viewImage(all.map((x) => x.dataset.view), all.indexOf(v)); }
       const dn = e.target.closest('[data-delnew]');
       if (dn) { const [x] = newFiles.splice(Number(dn.dataset.delnew), 1); URL.revokeObjectURL(x.url); return drawImgs(); }
       const di = e.target.closest('[data-delimg]');
@@ -1410,7 +1437,7 @@ function memberSheet(id) {
       <div class="row2"><input class="input" id="ms-w" inputmode="decimal" value="${m.weight}"><button class="btn" id="ms-save" style="flex:none">保存</button></div></div></div>
       <button class="btn danger block" id="ms-del">从这次游玩中移除</button>` : ''}
     ${S.me !== id ? `<button class="btn ghost block" id="ms-me" style="margin-top:8px">这是我</button>` : ''}`, (el) => {
-    el.querySelectorAll('[data-view]').forEach((x) => x.onclick = () => viewImage(`/api/t/${S.key}/paycode/${id}/${x.dataset.view}?v=${m.codes[x.dataset.view]}`));
+    el.querySelectorAll('[data-view]').forEach((x, i, all) => x.onclick = () => viewImage([...all].map((y) => `/api/t/${S.key}/paycode/${id}/${y.dataset.view}?v=${m.codes[y.dataset.view]}`), i));
     el.querySelectorAll('[data-up]').forEach((x) => x.onclick = async () => {
       const [file] = await pickFiles(false); if (!file) return;
       try {

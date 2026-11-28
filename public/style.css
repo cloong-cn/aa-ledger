@@ -194,8 +194,17 @@ textarea.input { resize: vertical; min-height: 64px; }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .thumb .del { position: absolute; top: 3px; right: 3px; width: 22px; height: 22px; border-radius: 50%; border: 0; background: rgba(0,0,0,.6); color: #fff; font-size: 13px; line-height: 22px; padding: 0; cursor: pointer; }
 .thumb.add { display: grid; place-items: center; font-size: 26px; color: var(--muted); border: 1.5px dashed var(--line); background: none; }
-#viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.92); display: grid; place-items: center; padding: 16px; }
-#viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
+#viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.92); }
+#viewer .track { display: flex; width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; overscroll-behavior: contain; scrollbar-width: none; }
+#viewer .track::-webkit-scrollbar { display: none; }
+#viewer .slide { flex: 0 0 100%; height: 100%; scroll-snap-align: center; scroll-snap-stop: always; display: grid; place-items: center; padding: calc(56px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom)); }
+#viewer img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; -webkit-user-select: none; }
+#viewer .count { position: absolute; top: calc(20px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); color: #fff; font-size: 14px; font-variant-numeric: tabular-nums; background: rgba(255,255,255,.14); padding: 3px 12px; border-radius: 999px; pointer-events: none; }
+#viewer .nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 44px; border-radius: 50%; border: 0; background: rgba(255,255,255,.16); color: #fff; font-size: 28px; line-height: 40px; padding: 0; cursor: pointer; }
+#viewer .nav[hidden] { display: none; }
+#viewer .prev { left: 10px; }
+#viewer .next { right: 10px; }
+@media (hover: none) { #viewer .nav { display: none; } }
 #viewer .close { position: absolute; top: calc(12px + env(safe-area-inset-top)); right: 12px; }
 
 /* ========== 结算 ========== */
