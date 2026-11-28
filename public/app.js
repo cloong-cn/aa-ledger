@@ -124,7 +124,12 @@ const $back = document.getElementById('sheet-backdrop');
 // 动效：弹层关闭时先往下滑出再隐藏；系统开了「减少动态效果」就直接隐藏
 const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 let closeTimer = null;
+// 手机返回键：打开弹窗 / 大图时多压一条历史记录，按返回只关掉最上面那层，不离开页面
+let popSkip = 0, pendingGo = null;
+function pushOverlay(kind) { history.pushState({ ov: kind }, '', location.href); }
+function popOverlay(kind) { if (history.state?.ov === kind) { popSkip++; history.back(); } }
 function openSheet(html, onMount) {
+  if ($sheet.hidden || $sheet.classList.contains('closing')) { if (history.state?.ov !== 'sheet') pushOverlay('sheet'); }
   clearTimeout(closeTimer); $sheet.classList.remove('closing'); $back.classList.remove('closing');
   $sheet.innerHTML = `<div class="grab"></div>${html}`;
   $sheet.hidden = false; $back.hidden = false;
@@ -132,7 +137,8 @@ function openSheet(html, onMount) {
   $sheet.scrollTop = 0;
   onMount && onMount($sheet);
 }
-function closeSheet() {
+function closeSheet(fromPop = false) {
+  if (!fromPop && !$sheet.hidden) popOverlay('sheet');
   document.body.style.overflow = '';
   const done = () => { $sheet.hidden = true; $back.hidden = true; $sheet.innerHTML = ''; $sheet.classList.remove('closing'); $back.classList.remove('closing'); };
   clearTimeout(closeTimer);
@@ -185,6 +191,7 @@ function viewImage(items, index = 0, opts = {}) {
     <div class="vbottom"><div class="caption"></div>
       ${many ? `<div class="strip">${V.items.map((x, i) => `<button class="sthumb" data-go="${i}" aria-label="第 ${i + 1} 张"><img src="${esc(x.src)}" alt="" loading="lazy"></button>`).join('')}</div>` : ''}</div>
     <button class="icon-btn close" aria-label="关闭">✕</button>`;
+  if ($viewer.hidden) pushOverlay('viewer');
   $viewer.hidden = false;
   const track = $viewer.querySelector('.track');
   track.scrollLeft = index * track.clientWidth;
@@ -206,7 +213,7 @@ function viewerSync() {
   }
   zoomReset();
   const cap = $viewer.querySelector('.caption');
-  const can = V.opts.saveNote && x.id;
+  const can = V.opts.saveNote && x.id && x.canEdit;
   cap.innerHTML = x.note ? `<p class="ctext">${esc(x.note)}</p>${can ? '<button class="cedit" data-note="1">✎ 改备注</button>' : ''}`
     : can ? '<button class="cedit" data-note="1">✎ 加备注</button>' : '';
 }
@@ -227,7 +234,7 @@ function viewerGo(i) {
   if (track && i >= 0 && i < V.items.length) track.scrollTo({ left: i * track.clientWidth, behavior: 'smooth' });
 }
 const viewerStep = (d) => viewerGo(V.i + d);
-function closeViewer() { $viewer.hidden = true; $viewer.innerHTML = ''; V.z = null; }
+function closeViewer(fromPop = false) { if (!fromPop && !$viewer.hidden) popOverlay('viewer'); $viewer.hidden = true; $viewer.innerHTML = ''; V.z = null; }
 $viewer.addEventListener('click', (e) => {
   if (V.z?.moved) { V.z.moved = false; return; }
   const t = e.target;
@@ -364,11 +371,33 @@ function pickFiles(multiple = true) {
 // ---------- 状态与路由 ----------
 const S = { me: null, admin: null, today: null, trip: null, key: null, tab: 'bills', adminTab: 'trips', statYear: null };
 
+// 返回时回到原来的滚动位置（按网址记）；回到同一次游玩时保留之前的标签页、筛选和展开的日期
+history.scrollRestoration = 'manual';
+const scrollPos = new Map();
+let tripView = null, curPath = location.pathname;
 function go(path, replace = false) {
+  if (popSkip) { pendingGo = [path, replace]; return; }   // 正在关弹窗（history.back 还没回来），等它回来再跳
+  scrollPos.set(curPath, scrollY);
   history[replace ? 'replaceState' : 'pushState'](null, '', path);
-  route();
+  curPath = location.pathname;
+  // 从首页点回刚才看的那次游玩，也回到原来的位置
+  const back = tripView && path === `/t/${tripView.key}` ? scrollPos.get(path) || 0 : 0;
+  route().then(() => scrollTo(0, back));
 }
-window.addEventListener('popstate', () => { closeSheet(); route(); });
+window.addEventListener('popstate', async () => {
+  if (popSkip) {
+    popSkip--;
+    if (!popSkip && pendingGo) { const [p, r] = pendingGo; pendingGo = null; go(p, r); }
+    return;
+  }
+  if (!$viewer.hidden) return closeViewer(true);
+  if (!$sheet.hidden) return closeSheet(true);
+  scrollPos.set(curPath, scrollY);
+  curPath = location.pathname;
+  const y = scrollPos.get(curPath) || 0;
+  await route();
+  scrollTo(0, y);
+});
 document.addEventListener('click', (e) => {
   const a = e.target.closest('a[data-link]');
   if (a) { e.preventDefault(); go(a.getAttribute('href')); }
@@ -381,9 +410,14 @@ async function route() {
     S.admin = meRes.admin; S.today = meRes.today;
   } catch (e) { $app.innerHTML = `<div class="wrap"><div class="empty"><div class="e">📡</div>${esc(e.message)}</div></div>`; return; }
   if (m) {
-    if (S.key !== m[1]) { S.key = m[1]; S.tab = 'bills'; S.trip = null; S.billFilter = 'all'; S.openDays = null; }
+    if (S.key !== m[1]) {
+      S.key = m[1]; S.trip = null;
+      if (tripView?.key === m[1]) Object.assign(S, tripView.v);
+      else Object.assign(S, { tab: 'bills', billFilter: 'all', openDays: null });
+    }
     return loadTrip(true);
   }
+  if (S.key) tripView = { key: S.key, v: { tab: S.tab, billFilter: S.billFilter, openDays: S.openDays } };
   S.trip = null; S.key = null;
   if (!S.admin) return renderLogin();
   return renderAdmin();
@@ -802,9 +836,11 @@ function renderBills(body) {
         <b class="num">${money(sum)}</b><span class="chev" aria-hidden="true">›</span></button>`;
       continue;
     }
+    // 账多时屏幕外的列表先不绘制（content-visibility），按每行约 71px 估高度，滚动条和返回时的位置才准
+    const lst = list.length > 10 ? `<div class="list cv" style="contain-intrinsic-size:auto ${list.length * 71}px">` : '<div class="list">';
     html += fold
-      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button><div class="list">`
-      : `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div><div class="list">`;
+      ? `<button class="day-head open" data-day="${day}"><span>${md(day)} ${wk(day)} <span class="chev" aria-hidden="true">›</span></span><span class="num">${money(sum)}</span></button>${lst}`
+      : `<div class="day-head"><span>${md(day)} ${wk(day)}</span><span class="num">${money(sum)}</span></div>${lst}`;
     for (const e of list) {
       const mineShare = S.me ? e.shares.find((s) => s.memberId === S.me) : null;
       const sub = `${e.currency !== BASE ? `<b class="cur-tag">${esc(curMoney(e.currency, e.origCents))}</b> · ` : ''}${esc(nameOf(e.payerId))} 付 · ${e.shares.length === d.members.length ? '全员' : e.shares.length + ' 人'}分${e.images.length ? ` · 📷${e.images.length}` : ''}${e.note ? ' · 📝' : ''}`;
@@ -833,6 +869,12 @@ function exactNote(e) {
   const fmt = (x) => { const v = Number(x.n) / Number(x.d) / 100, t = Math.round(v * 1000) / 1000; return (Math.abs(v - t) > 1e-9 ? '约 ' : '') + t.toFixed(3).replace(/0$/, ''); };
   return `<p class="faint tiny" style="margin:8px 0 0">这笔除不尽，精确是 ${ex.map((x) => `${esc(nameOf(x.memberId))} ${fmt(x)}`).join('，')}。结算时按精确金额合计，最后四舍五入到分。</p>`;
 }
+// 图片备注：只有传图的人（旧图按这笔账的记账人）和管理员能改
+function canNote(e, imgId) {
+  if (S.admin) return true;
+  const owner = (e.imageBy || {})[imgId] || e.createdBy;
+  return !!(S.me && owner && owner !== '未署名' && nameOf(S.me) === owner);
+}
 function expenseDetail(id) {
   const e = T().expenses.find((x) => x.id === id);
   if (!e) return;
@@ -857,7 +899,7 @@ function expenseDetail(id) {
     <p class="faint tiny" style="margin:14px 2px">${esc(e.createdBy || '未署名')} 记于 ${fmtTime(e.createdAt)}${e.updatedAt && new Date(e.updatedAt) - new Date(e.createdAt) > 2000 ? ` · 修改于 ${fmtTime(e.updatedAt)}` : ''}</p>
     ${editable() ? `<div class="btns"><button class="btn danger" id="ed-del">删除</button><button class="btn primary" id="ed-edit">修改</button></div>` : ''}`, (el) => {
     el.querySelectorAll('[data-img]').forEach((b, i) => b.onclick = () => viewImage(
-      e.images.map((id) => ({ src: `/api/t/${S.key}/images/${id}`, id, note: notes[id] || '' })), i,
+      e.images.map((id) => ({ src: `/api/t/${S.key}/images/${id}`, id, note: notes[id] || '', canEdit: canNote(e, id) })), i,
       editable() ? { saveNote: async (id, note) => { await api('PATCH', `/api/t/${S.key}/images/${id}`, { note }); await refresh(); if (!$sheet.hidden) expenseDetail(e.id); return note; } } : {}));
     const del = el.querySelector('#ed-del');
     if (del) del.onclick = async () => {

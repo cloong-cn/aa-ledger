@@ -127,7 +127,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .day-fold .chev, .day-head .chev { color: var(--faint); font-size: 18px; line-height: 1; }
 .link-btn { border: 0; background: none; padding: 4px 0; font: inherit; font-size: 13px; color: var(--accent); cursor: pointer; }
 .fold-all { display: flex; justify-content: flex-end; margin: 0 4px -8px; }
-.list { content-visibility: auto; contain-intrinsic-size: auto 300px; background: var(--card); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; }
+.list.cv { content-visibility: auto; }
+.list { background: var(--card); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; }
 .item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; width: 100%; border: 0; background: none; text-align: left; }
 .item + .item { border-top: 1px solid var(--line); }
 .item:active { background: var(--soft); }
@@ -319,7 +320,7 @@ textarea.input { resize: vertical; min-height: 64px; }
 
 /* ========== 弹层 ========== */
 #sheet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.38); z-index: 40; }
-#sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 41; max-height: 92vh; overflow-y: auto; overscroll-behavior: contain;
+#sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 41; max-height: 92vh; max-height: 92dvh; overflow-y: auto; overscroll-behavior: contain;  /* dvh：手机地址栏展开时也不会顶出屏幕 */
   background: var(--bg); border-radius: 22px 22px 0 0; padding: 8px 16px calc(20px + env(safe-area-inset-bottom));
   max-width: 600px; margin: 0 auto; animation: up .22s ease-out; }
 @keyframes up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }

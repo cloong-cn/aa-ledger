@@ -85,7 +85,7 @@ r = await call('POST', `/api/t/${key}/members`, { name: 'zz戊' }); const Ex = r
 r = await call('DELETE', `/api/t/${key}/members/${Ex}`); ok('无账的人能移除', r.status === 200);
 
 // 截图
-r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/png' });
+r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/png', actor: A });
 ok('上传图片', r.status === 200); const IMG = r.data.id;
 r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: Buffer.from('<svg></svg>'), type: 'image/png' });
 ok('伪造图片被拒', r.status === 400);
@@ -96,9 +96,14 @@ ok('svg 类型被拒', r.status === 415);
   ok('超过 5MB 被拒', s === 413, s); }
 r = await call('GET', `/api/t/${key}/images/${IMG}`);
 ok('读取图片', r.status === 200 && r.ct === 'image/png' && Buffer.compare(r.data, PNG) === 0);
-r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '  团购券截图 ' }); ok('图片备注', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '  团购券截图 ' }, { actor: A }); ok('传图人能改备注', r.status === 200, r.status);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '别人改的' }, { actor: B }); ok('别人不能改备注', r.status === 403, r.status);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '别人改的' }); ok('未署名不能改备注', r.status === 403, r.status);
+{ const c = cookie; cookie = adminCookie;
+  r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '团购券截图' }); ok('管理员能改备注', r.status === 200, r.status);
+  cookie = c; }
 r = await call('GET', `/api/t/${key}`); ok('备注出现在账目里', r.data.expenses.find((e) => e.id === E1).imageNotes[IMG] === '团购券截图', JSON.stringify(r.data.expenses.find((e) => e.id === E1).imageNotes));
-r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '字'.repeat(201) }); ok('备注超长被拒', r.status === 400);
+r = await call('PATCH', `/api/t/${key}/images/${IMG}`, { note: '字'.repeat(201) }, { actor: A }); ok('备注超长被拒', r.status === 400);
 // 收款码
 r = await call('PUT', `/api/t/${key}/paycode/${B}/wechat`, null, { raw: PNG, type: 'image/png' }); ok('上传收款码', r.status === 200);
 r = await call('GET', `/api/t/${key}`); ok('收款码标记', !!r.data.members.find((m) => m.id === B).codes.wechat);

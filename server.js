@@ -264,16 +264,16 @@ async function tripPayload(trip, admin) {
     db.query(`SELECT m.id, m.person_id, p.name, m.weight::float AS weight FROM members m JOIN people p ON p.id=m.person_id WHERE m.trip_id=$1 ORDER BY m.id`, [trip.id]),
     db.query(`SELECT id, payer_id, cents, currency, orig_cents, rate::float AS rate, cny_override, category, title, note, to_char(day,'YYYY-MM-DD') AS day, created_by, created_at, updated_at FROM expenses WHERE trip_id=$1 ORDER BY day DESC, id DESC`, [trip.id]),
     db.query(`SELECT s.expense_id, s.member_id, s.weight::float AS weight, s.fixed_cents, s.orig_cents, s.cents FROM expense_shares s JOIN expenses e ON e.id=s.expense_id WHERE e.trip_id=$1 ORDER BY s.member_id`, [trip.id]),
-    db.query(`SELECT i.id, i.expense_id, i.note FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1 ORDER BY i.id`, [trip.id]),
+    db.query(`SELECT i.id, i.expense_id, i.note, i.created_by FROM images i JOIN expenses e ON e.id=i.expense_id WHERE e.trip_id=$1 ORDER BY i.id`, [trip.id]),
     db.query(`SELECT id, from_id, to_id, cents, created_by, created_at FROM payments WHERE trip_id=$1 ORDER BY id`, [trip.id]),
     db.query(`SELECT c.person_id, c.kind, c.updated_at FROM pay_codes c JOIN members m ON m.person_id=c.person_id WHERE m.trip_id=$1`, [trip.id]),
     db.query(`SELECT currency, rate::float AS rate, updated_at FROM trip_rates WHERE trip_id=$1`, [trip.id]),
   ]);
   const base = trip.base_currency;
   const live = await liveRates();
-  const byExp = new Map(exps.map((e) => [e.id, { shares: [], images: [], imageNotes: {} }]));
+  const byExp = new Map(exps.map((e) => [e.id, { shares: [], images: [], imageNotes: {}, imageBy: {} }]));
   for (const s of shares) byExp.get(s.expense_id)?.shares.push({ memberId: s.member_id, weight: s.weight, fixed: s.fixed_cents, origCents: s.orig_cents, cents: s.cents });
-  for (const i of imgs) { const x = byExp.get(i.expense_id); if (!x) continue; x.images.push(i.id); if (i.note) x.imageNotes[i.id] = i.note; }
+  for (const i of imgs) { const x = byExp.get(i.expense_id); if (!x) continue; x.images.push(i.id); if (i.note) x.imageNotes[i.id] = i.note; if (i.created_by) x.imageBy[i.id] = i.created_by; }
   const expenses = exps.map((e) => ({
     id: e.id, payerId: e.payer_id, cents: e.cents, currency: e.currency, origCents: e.orig_cents, rate: e.rate, baseOverride: e.cny_override, category: e.category, title: e.title, note: e.note, day: e.day,
     createdBy: e.created_by, createdAt: e.created_at, updatedAt: e.updated_at, ...byExp.get(e.id),
@@ -695,8 +695,9 @@ route('POST', '/api/t/:key/expenses/:id/images', async ({ params, rawBody, req, 
     if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`每笔最多 ${MAX_IMAGES_PER_EXPENSE} 张图`);
     if (await tripImageBytes(q, trip.id) + img.bytes > TRIP_IMAGE_QUOTA)
       throw bad(`这次游玩的截图已满 ${TRIP_IMAGE_QUOTA / MB}MB（含最近删除），删掉一些再传`);
-    const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes) VALUES($1,$2,$3,$4) RETURNING id`, [e.id, img.file, img.mime, img.bytes]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtMoney(trip.base_currency, e.cents)}」加了一张图`);
+    const actor = await actorName(q, trip, req, admin);
+    const { rows: [r] } = await q.query(`INSERT INTO images(expense_id,file,mime,bytes,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id`, [e.id, img.file, img.mime, img.bytes, actor]);
+    await log(q, trip.id, actor, 'image.add', `给「${e.title || CATEGORIES[e.category]} ${fmtMoney(trip.base_currency, e.cents)}」加了一张图`);
     return { id: r.id };
   }).catch((err) => { removeFiles([img.file]); throw err; });
 }, { raw: true });
@@ -707,11 +708,14 @@ route('PATCH', '/api/t/:key/images/:id', async ({ params, body, req, admin }) =>
   const note = String(body.note ?? '').trim();
   if ([...note].length > 200) throw bad('图片备注最多 200 字');
   return tripTx(trip, async (q) => {
-    const { rows: [i] } = await q.query(`SELECT i.id, i.note, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
+    const { rows: [i] } = await q.query(`SELECT i.id, i.note, i.created_by, e.created_by AS exp_by, e.title, e.category, e.cents FROM images i JOIN expenses e ON e.id=i.expense_id WHERE i.id=$1 AND e.trip_id=$2`, [params.id, trip.id]);
     if (!i) throw new HttpError(404, '图片不存在');
+    // 只有传图的人（旧图没记传图人，就按这笔账的记账人）和管理员能改备注
+    const actor = await actorName(q, trip, req, admin), owner = i.created_by || i.exp_by;
+    if (!admin && (actor !== owner || actor === '未署名')) throw new HttpError(403, owner && !['未署名', '管理员'].includes(owner) ? `只有传这张图的「${owner}」和管理员能改备注` : '只有管理员能改这张图的备注');
     if (i.note === note) return { ok: true };
     await q.query(`UPDATE images SET note=$1 WHERE id=$2`, [note, i.id]);
-    await log(q, trip.id, await actorName(q, trip, req, admin), 'image.note',
+    await log(q, trip.id, actor, 'image.note',
       `${note ? '把' : '清空了'}「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」一张图的备注${note ? `改成「${note}」` : ''}`);
     return { ok: true };
   });
@@ -725,7 +729,7 @@ route('DELETE', '/api/t/:key/images/:id', async ({ params, req, admin }) => {
     const actor = await actorName(q, trip, req, admin);
     const label = `「${i.title || CATEGORIES[i.category]} ${fmtMoney(trip.base_currency, i.cents)}」的一张图`;
     await q.query(`INSERT INTO trash(trip_id,kind,label,data,files,deleted_by) VALUES($1,'image',$2,$3,$4,$5)`,
-      [trip.id, label, JSON.stringify({ image: { id: i.id, expense_id: i.expense_id, file: i.file, mime: i.mime, bytes: i.bytes, note: i.note, created_at: i.created_at } }), [i.file], actor]);
+      [trip.id, label, JSON.stringify({ image: { id: i.id, expense_id: i.expense_id, file: i.file, mime: i.mime, bytes: i.bytes, note: i.note, created_by: i.created_by, created_at: i.created_at } }), [i.file], actor]);
     await q.query(`DELETE FROM images WHERE id=$1`, [i.id]);
     await log(q, trip.id, actor, 'image.remove', `删除了${label}`);
   });
@@ -757,7 +761,7 @@ route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) =>
       if (!e) throw bad('这张图所属的账目已经删除了，先恢复那笔账');
       const { rows: [{ n }] } = await q.query(`SELECT count(*)::int AS n FROM images WHERE expense_id=$1`, [e.id]);
       if (n >= MAX_IMAGES_PER_EXPENSE) throw bad(`这笔账已经有 ${MAX_IMAGES_PER_EXPENSE} 张图了`);
-      await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, [i.id, e.id, i.file, i.mime, i.bytes, i.note || '', i.created_at]);
+      await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [i.id, e.id, i.file, i.mime, i.bytes, i.note || '', i.created_by || '', i.created_at]);
     } else {
       const { expense: x, shares, images } = t.data;
       const mm = await memberMap(q, trip.id);
@@ -773,7 +777,7 @@ route('POST', '/api/t/:key/trash/:id/restore', async ({ params, req, admin }) =>
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),$11,$12,$13,$14)`,
         [x.id, trip.id, x.payer_id, cents, x.category, x.title, x.note, x.day, x.created_by, x.created_at, x.currency, x.orig_cents, rate, override]);
       await writeShares(q, x.id, split);
-      for (const i of images) await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, [i.id, x.id, i.file, i.mime, i.bytes, i.note || '', i.created_at]);
+      for (const i of images) await q.query(`INSERT INTO images(id,expense_id,file,mime,bytes,note,created_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [i.id, x.id, i.file, i.mime, i.bytes, i.note || '', i.created_by || '', i.created_at]);
     }
     await log(q, trip.id, actor, t.kind + '.restore', `恢复了${t.kind === 'image' ? '' : '一笔：'}${t.label}`);
     return { ok: true, expenseId: t.kind === 'image' ? t.data.image.expense_id : t.data.expense.id };
