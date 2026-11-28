@@ -43,7 +43,9 @@ ok('凭链接访问', r.status === 200 && r.data.members.length === 3 && !r.data
 const [A, B, C] = r.data.members.map((m) => m.id);
 r = await call('POST', `/api/t/${key}/members`, { name: 'zz路人' }); ok('不选我是谁也能加入名单', r.status === 200);
 r = await call('PATCH', `/api/t/${key}/members/${r.data.id}`, { weight: '1' }); ok('不选我是谁不能改东西', r.status === 403 && r.data.code === 'who_required', JSON.stringify(r.data));
-r = await call('DELETE', `/api/t/${key}/members/${(await call('GET', `/api/t/${key}`)).data.members.find((m) => m.name === 'zz路人').id}`, undefined, { actor: A });
+{ const lr = (await call('GET', `/api/t/${key}`)).data.members.find((m) => m.name === 'zz路人').id;
+  r = await call('DELETE', `/api/t/${key}/members/${lr}`, undefined, { actor: A }); ok('不能移除别人', r.status === 403);
+  r = await call('DELETE', `/api/t/${key}/members/${lr}`, undefined, { actor: lr }); ok('本人能退出', r.status === 200); }
 defActor = A;
 r = await call('GET', '/api/t/AAAAAAAAAAAAAAAAAAAAAA'); ok('错误链接 404', r.status === 404);
 r = await call('GET', '/api/admin/trips'); ok('非管理员不能列游玩', r.status === 401);
@@ -52,7 +54,8 @@ r = await call('GET', '/api/admin/trips'); ok('非管理员不能列游玩', r.s
 r = await call('POST', `/api/t/${key}/members`, { name: 'zz丁' }, { actor: A });
 ok('加人', r.status === 200); const D = r.data.id;
 r = await call('POST', `/api/t/${key}/members`, { name: 'zz丁' }); ok('重复加人被拒', r.status === 400);
-r = await call('PATCH', `/api/t/${key}/members/${D}`, { weight: '2' }); ok('改份数', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${D}`, { weight: '2' }); ok('不能改别人的份数', r.status === 403);
+r = await call('PATCH', `/api/t/${key}/members/${D}`, { weight: '2' }, { actor: D }); ok('改自己的份数', r.status === 200);
 
 // 记账：默认全员
 r = await call('POST', `/api/t/${key}/expenses`, { amount: '100', title: '晚饭', category: 'food', payerId: A, day: '2026-11-20',
@@ -92,9 +95,9 @@ r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, 
 r = await call('PUT', `/api/t/${key}/expenses/${E1}`, { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费',
   shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) }, { actor: A });
 ok('记账人能改账', r.status === 200);
-r = await call('DELETE', `/api/t/${key}/members/${D}`); ok('有账的人不能移除', r.status === 400);
+r = await call('DELETE', `/api/t/${key}/members/${D}`, undefined, { actor: D }); ok('有账的人不能移除', r.status === 400);
 r = await call('POST', `/api/t/${key}/members`, { name: 'zz戊' }); const Ex = r.data.id;
-r = await call('DELETE', `/api/t/${key}/members/${Ex}`); ok('无账的人能移除', r.status === 200);
+r = await call('DELETE', `/api/t/${key}/members/${Ex}`, undefined, { actor: Ex }); ok('无账的人能移除', r.status === 200);
 
 // 截图
 r = await call('POST', `/api/t/${key}/expenses/${E1}/images`, null, { raw: PNG, type: 'image/png', actor: A });
@@ -139,7 +142,9 @@ r = await call('GET', `/api/t/${key}`); ok('转账后剩 2 笔', r.data.transfer
 r = await call('DELETE', `/api/t/${key}/payments/${P1}`, undefined, { actor: t0.fromId === A ? B : A }); ok('别人不能撤销转账', r.status === 403);
 r = await call('DELETE', `/api/t/${key}/payments/${P1}`, undefined, { actor: t0.fromId }); ok('撤销转账', r.status === 200);
 r = await call('GET', `/api/t/${key}`);
-for (const t of r.data.transfers) await call('POST', `/api/t/${key}/payments`, { fromId: t.fromId, toId: t.toId, amount: (t.cents / 100).toFixed(2) });
+{ const t = r.data.transfers.find((x) => x.fromId !== A && x.toId !== A);
+  if (t) { const rr = await call('POST', `/api/t/${key}/payments`, { fromId: t.fromId, toId: t.toId, amount: (t.cents / 100).toFixed(2) }); ok('不能替别人标记已转', rr.status === 403); } }
+for (const t of r.data.transfers) await call('POST', `/api/t/${key}/payments`, { fromId: t.fromId, toId: t.toId, amount: (t.cents / 100).toFixed(2) }, { actor: t.fromId });
 r = await call('GET', `/api/t/${key}`); ok('全部结清', r.data.transfers.length === 0 && r.data.balances.every((b) => b.net === 0));
 
 // 成员密码
@@ -148,9 +153,9 @@ r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '12a4' }, { actor
 r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '2468' }, { actor: B }); ok('设密码', r.status === 200 && r.data.token);
 const TB = r.data.token;
 r = await call('GET', `/api/t/${key}`); ok('hasPin 标记', r.data.members.find((m) => m.id === B).hasPin && !r.data.members.find((m) => m.id === A).hasPin);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B }); ok('没凭证冒充有密码的人被拒', r.status === 403 && r.data.code === 'pin_required', JSON.stringify(r.data));
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: 'x'.repeat(32) }); ok('假凭证被拒', r.status === 403);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB }); ok('带凭证能操作', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B }); ok('没凭证冒充有密码的人被拒', r.status === 403 && r.data.code === 'pin_required', JSON.stringify(r.data));
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B, token: 'x'.repeat(32) }); ok('假凭证被拒', r.status === 403);
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B, token: TB }); ok('带凭证能操作', r.status === 200);
 r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '0000' }, { actor: 0 }); ok('输错密码', r.status === 403 && /还能试 4 次/.test(r.data.error), JSON.stringify(r.data));
 r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '2468' }, { actor: 0 }); ok('输对密码拿到凭证', r.status === 200 && r.data.token && r.data.token !== TB);
 const TB2 = r.data.token;
@@ -158,15 +163,15 @@ r = await call('POST', `/api/t/${key}/members/${A}/claim`, { pin: '' }, { actor:
 for (let i = 0; i < 5; i++) r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '1111' }, { actor: 0 });
 ok('输错 5 次锁定', r.status === 429, JSON.stringify(r.data));
 r = await call('POST', `/api/t/${key}/members/${B}/claim`, { pin: '2468' }, { actor: 0 }); ok('锁定期间输对也不行', r.status === 429);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB2 }); ok('已有凭证不受锁定影响', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B, token: TB2 }); ok('已有凭证不受锁定影响', r.status === 200);
 r = await call('PUT', `/api/t/${key}/members/${B}/pin`, { pin: '1357' }, { actor: B, token: TB2 }); ok('改密码', r.status === 200);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B, token: TB }); ok('改密码后旧凭证失效', r.status === 403);
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B, token: TB }); ok('改密码后旧凭证失效', r.status === 403);
 r = await call('DELETE', `/api/t/${key}/members/${B}/pin`); ok('别人不能取消密码', r.status === 403);
 { const c = cookie; cookie = adminCookie;
   r = await call('DELETE', `/api/t/${key}/members/${B}/pin`, undefined, { actor: 0 }); ok('管理员重置密码', r.status === 200);
   cookie = c; }
 r = await call('GET', `/api/t/${key}`); ok('重置后没有密码', !r.data.members.find((m) => m.id === B).hasPin);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: B }); ok('重置后不用凭证', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${B}`, { weight: '1' }, { actor: B }); ok('重置后不用凭证', r.status === 200);
 
 // 这次游玩的管理员
 const E1body = { amount: '120', title: '晚饭火锅', category: 'food', payerId: A, day: '2026-11-20', note: '含服务费', shares: [A, B, C].map((id) => ({ memberId: id, weight: 1 })) };
@@ -181,7 +186,7 @@ r = await call('PUT', `/api/t/${key}/members/${C}/pin`, { pin: '9090' }, { actor
 r = await call('PUT', `/api/t/${key}/expenses/${E1}`, E1body, { actor: C, token: TC }); ok('管理员能改别人的账', r.status === 200, JSON.stringify(r.data));
 r = await call('PUT', `/api/t/${key}/members/${A}/pin`, { pin: '1212' }, { actor: A }); const TA = r.data.token;
 r = await call('DELETE', `/api/t/${key}/members/${A}/pin`, undefined, { actor: C, token: TC }); ok('管理员能重置别人的密码', r.status === 200);
-r = await call('PATCH', `/api/t/${key}/members/${C}`, { weight: '1' }, { actor: A, token: TA }); ok('重置后 A 不用凭证', r.status === 200);
+r = await call('PATCH', `/api/t/${key}/members/${A}`, { weight: '1' }, { actor: A, token: TA }); ok('重置后 A 不用凭证', r.status === 200);
 r = await call('GET', `/api/t/${key}/log`);
 ok('操作记录标出管理员身份', r.data.items.some((i) => i.actor === 'zz丙（管理员）' && i.action === 'expense.edit'), JSON.stringify(r.data.items.slice(0, 4)));
 ok('操作记录有分页字段', Array.isArray(r.data.items) && typeof r.data.more === 'boolean');

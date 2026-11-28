@@ -443,6 +443,7 @@ route('PATCH', '/api/t/:key/members/:id', async ({ params, body, req, admin }) =
     const mm = await memberMap(q, trip.id);
     const m = mm.get(params.id);
     if (!m) throw new HttpError(404, '成员不存在');
+    if (req.actor?.id !== m.id) { if (!canManage(req, admin, trip)) throw new HttpError(403, `只有 ${m.name} 本人和管理员能改 TA 的份数`); req.asAdmin = !!req.actor; }
     await q.query(`UPDATE members SET weight=$1 WHERE id=$2`, [weight, m.id]);
     await log(q, trip.id, await actorName(q, trip, req, admin), 'member.edit', `把 ${m.name} 的默认份数改为 ${weight}`);
   });
@@ -454,6 +455,7 @@ route('DELETE', '/api/t/:key/members/:id', async ({ params, req, admin }) => {
   await tripTx(trip, async (q) => {
     const m = (await memberMap(q, trip.id)).get(params.id);
     if (!m) throw new HttpError(404, '成员不存在');
+    if (req.actor?.id !== m.id) { if (!canManage(req, admin, trip)) throw new HttpError(403, `只有 ${m.name} 本人和管理员能把 TA 移出去`); req.asAdmin = !!req.actor; }
     const { rows: [{ used }] } = await q.query(`SELECT
       EXISTS(SELECT 1 FROM expenses WHERE payer_id=$1) OR EXISTS(SELECT 1 FROM expense_shares WHERE member_id=$1)
       OR EXISTS(SELECT 1 FROM payments WHERE from_id=$1 OR to_id=$1) AS used`, [m.id]);
@@ -888,6 +890,9 @@ route('POST', '/api/t/:key/payments', async ({ params, body, req, admin }) => {
     const mm = await memberMap(q, trip.id);
     const from = mm.get(Number(body.fromId)), to = mm.get(Number(body.toId));
     if (!from || !to || from.id === to.id) throw bad('转账双方不对');
+    // 只有付钱的人、收钱的人和管理员能标记「已转」
+    if (!canManage(req, admin, trip) && req.actor?.id !== from.id && req.actor?.id !== to.id) throw new HttpError(403, `只有 ${from.name}、${to.name} 本人和管理员能标记这笔已转`);
+    if (canManage(req, admin, trip) && req.actor?.id !== from.id && req.actor?.id !== to.id) req.asAdmin = !!req.actor;
     const cents = parseAmount(body.amount);
     if (!cents || cents % unitOf(trip.base_currency)) throw bad('金额不对');
     const actor = await actorName(q, trip, req, admin);

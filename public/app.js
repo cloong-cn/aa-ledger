@@ -1343,7 +1343,7 @@ function renderSettle(body) {
         const hasCode = to && (to.codes.wechat || to.codes.alipay);
         const mine = S.me && (x.fromId === S.me || x.toId === S.me);
         return `<div class="xfer ${mine ? 'me' : ''}" data-ft="${x.fromId}-${x.toId}"><div class="who" data-remind="${i}" role="button" tabindex="0" title="复制提醒文字"><b>${esc(nameOf(x.fromId))}</b><span class="arrow">→</span><b>${esc(nameOf(x.toId))}</b><div class="amt num">${money(x.cents)}</div></div>
-          <div class="acts"><button class="btn small" data-remind="${i}">催款</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
+          <div class="acts"><button class="btn small" data-remind="${i}">催款</button>${hasCode ? `<button class="btn small" data-code="${x.toId}">收款码</button>` : ''}${editable() && (canManage() || S.me === x.fromId || S.me === x.toId) ? `<button class="btn small primary" data-paid="${i}">已转</button>` : ''}</div></div>`;
       }).join('')}
       <div style="padding:10px 16px 12px"><button class="btn block" id="remind-all">📋 复制催款消息（发到群里）</button></div></div>`;
   } else {
@@ -1654,7 +1654,7 @@ function renderPeople(body) {
     return `<div class="mem"><span class="avatar">${esc([...m.name][0])}</span>
       <span class="main"><b>${esc(m.name)}</b>${m.id === S.me ? ' <span class="tag ink">我</span>' : ''}${m.id === t.adminId ? ' <span class="tag admin">👑 管理员</span>' : ''}${m.hasPin ? ' <span class="faint small">🔒</span>' : ''}${m.weight !== 1 ? ` <span class="tag">${m.weight} 份</span>` : ''}
         <div class="s">${codes.length ? `收款码：${codes.join('、')}` : '还没有收款码'}</div></span>
-      <button class="btn small" data-mem="${m.id}">${ed ? '设置' : '查看'}</button></div>`;
+      <button class="btn small" data-mem="${m.id}">${ed && (m.id === S.me || canManage()) ? '设置' : '查看'}</button></div>`;
   }).join('') || '<div class="empty small">还没有成员</div>'}</div>`;
   if (ed) html += `<div class="row2" style="margin-top:10px"><input class="input" id="pm-new" maxlength="20" placeholder="临时加人：输入名字"><button class="btn primary" id="pm-add" style="flex:none">添加</button></div>`;
 
@@ -1821,7 +1821,7 @@ function memberSheet(id) {
         <p class="faint tiny" style="margin:8px 0 0">设了密码，别人就不能在他的手机上冒充你改账</p></div>`
       : mgr && m.hasPin ? `<div class="card"><div class="kv" style="align-items:center"><span>🔒 ${esc(m.name)} 设了密码</span><button class="btn small danger" id="ms-reset">重置</button></div>
         <p class="faint tiny" style="margin:8px 0 0">TA 忘了密码时用。重置后 TA 选「我是谁」就不用输密码了，可以再设新的</p></div>` : ''}
-    ${ed ? `<div class="card"><div class="field" style="margin:0"><label>默认份数（带家属可以填 2；记账时可以单独改）</label>
+    ${ed && (self || mgr) ? `<div class="card"><div class="field" style="margin:0"><label>默认份数（带家属可以填 2；记账时可以单独改）</label>
       <div class="row2"><input class="input" id="ms-w" inputmode="decimal" value="${m.weight}"><button class="btn" id="ms-save" style="flex:none">保存</button></div></div></div>
       <button class="btn danger block" id="ms-del">从这次游玩中移除</button>` : ''}
     ${S.me !== id ? `<button class="btn ghost block" id="ms-me" style="margin-top:8px">这是我</button>` : ''}`, (el) => {
